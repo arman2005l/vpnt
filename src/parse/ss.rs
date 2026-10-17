@@ -2,7 +2,7 @@
 //!
 //! Supported formats:
 //!   1. SIP002: ss://<base64(method:password)>@<host>:<port>[/?plugin=...]#<name>
-//!              or ss://<method>:<password>@<host>:<port>#<name>  (some clients)
+//!      or ss://<method>:<password>@<host>:<port>#<name>  (some clients)
 //!   2. Legacy: ss://<base64(method:password@host:port)>#<name>
 //!
 //! Supported ciphers: whatever sing-box accepts; we pass the string through.
@@ -55,17 +55,20 @@ fn parse_sip002(raw: &str) -> Result<(String, Value)> {
         .ok_or_else(|| anyhow::anyhow!("ss SIP002: missing port"))?;
 
     // Userinfo: try base64(method:password) first, then plain method:password.
-    let userinfo = url.username();
+    let userinfo = match url.password() {
+        Some(pass) => format!("{}:{}", url.username(), pass),
+        None => url.username().to_string(),
+    };
     if userinfo.is_empty() {
         bail!("ss SIP002: missing userinfo");
     }
 
-    let (method, password) = decode_userinfo(userinfo)
+    let (method, password) = decode_userinfo(&userinfo)
         .context("ss SIP002: cannot decode userinfo")?;
 
     let name = url
         .fragment()
-        .map(|f| url_decode(f))
+        .map(url_decode)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("ss@{server}:{port}"));
 

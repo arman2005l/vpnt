@@ -13,7 +13,9 @@ pub struct ProxyConfig {
     pub settings: serde_json::Value,
     pub stream_settings: Option<serde_json::Value>,
     #[serde(default)]
-    pub rules_files: Vec<RuleKind>,
+    pub outbound: serde_json::Value,
+    #[serde(default)]
+    pub rules_files: Vec<RulesFile>,
 }
 
 impl Default for ProxyConfig {
@@ -26,22 +28,18 @@ impl Default for ProxyConfig {
             port: 443,
             settings: serde_json::Value::Null,
             stream_settings: None,
+            outbound: serde_json::Value::Null,
             rules_files: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DefaultMode {
+    #[default]
     Proxy,
     Direct,
     Block,
-}
-
-impl Default for DefaultMode {
-    fn default() -> Self {
-        DefaultMode::Proxy
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +51,30 @@ pub enum RuleKind {
     GeoIp,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RuleAction {
+    Proxy,
+    Direct,
+    Block,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    pub kind: RuleKind,
+    pub pattern: String,
+    pub action: RuleAction,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RulesFile {
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+}
+
+fn default_mixed_port() -> u16 {
+    10808
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub active_config_id: Option<String>,
@@ -61,6 +83,14 @@ pub struct Settings {
     pub mixed_port: u16,
     #[serde(default)]
     pub auto_connect: bool,
+    #[serde(default)]
+    pub default_mode: DefaultMode,
+    #[serde(default)]
+    pub socks_port: Option<u16>,
+    #[serde(default)]
+    pub http_port: Option<u16>,
+    #[serde(default)]
+    pub log_level: String,
 }
 
 impl Default for Settings {
@@ -70,6 +100,10 @@ impl Default for Settings {
             core_path: None,
             mixed_port: default_mixed_port(),
             auto_connect: false,
+            default_mode: DefaultMode::Proxy,
+            socks_port: Some(10808),
+            http_port: Some(10809),
+            log_level: "warn".into(),
         }
     }
 }

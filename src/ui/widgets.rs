@@ -188,7 +188,7 @@ pub fn proxy_list(frame: &mut Frame, area: Rect, state: &AppState) {
     let active_name = state
         .store
         .settings
-        .active_proxy
+        .active_config_id
         .as_deref()
         .unwrap_or("");
 

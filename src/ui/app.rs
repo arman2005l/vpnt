@@ -197,7 +197,7 @@ impl AppState {
         if self.active_tab == Tab::Proxies {
             if let Some(proxy) = self.store.proxies.get(self.proxy_cursor) {
                 let name = proxy.name.clone();
-                self.store.settings.active_proxy = Some(name.clone());
+                self.store.settings.active_config_id = Some(name.clone());
                 if let Err(e) = self.store.save(&self.data_dir) {
                     self.notice = Some(format!("Save failed: {e}"));
                 } else {
@@ -211,7 +211,7 @@ impl AppState {
 
     /// Return the currently active proxy, if one is configured.
     pub fn active_proxy(&self) -> Option<&ProxyConfig> {
-        let name = self.store.settings.active_proxy.as_deref()?;
+        let name = self.store.settings.active_config_id.as_deref()?;
         self.store.proxies.iter().find(|p| p.name == name)
     }
 

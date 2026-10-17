@@ -7,7 +7,7 @@ mod ui;
 
 use anyhow::Result;
 use directories::ProjectDirs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::WorkerGuard;
 
 pub fn data_dir() -> Result<PathBuf> {
@@ -29,7 +29,7 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn setup_logging(data: &PathBuf) -> Result<WorkerGuard> {
+fn setup_logging(data: &Path) -> Result<WorkerGuard> {
     let log_dir = data.join("logs");
     std::fs::create_dir_all(&log_dir)?;
     let file_appender = tracing_appender::rolling::daily(&log_dir, "vpnt.log");
@@ -47,8 +47,11 @@ async fn main() -> Result<()> {
     let _guard = setup_logging(&data)?;
     tracing::info!("vpnt starting");
 
-    let mut app = ui::App::new(data).await?;
-    app.run().await?;
+    let supervisor = core::Supervisor::new(
+        platform::singbox_bin(&data),
+        data.join(gen::CONFIG_FILENAME),
+    );
+    ui::run(supervisor, data).await?;
 
     tracing::info!("vpnt exiting");
     Ok(())

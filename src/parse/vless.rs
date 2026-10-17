@@ -55,7 +55,7 @@ pub fn parse(raw: &str) -> Result<(String, Value)> {
     // ── display name ──────────────────────────────────────────────────────────
     let name = url
         .fragment()
-        .map(|f| url_decode(f))
+        .map(url_decode)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("vless@{server}:{port}"));
 

@@ -201,6 +201,7 @@ fn build_route(proxy: &ProxyConfig, settings: &Settings) -> Value {
     let final_tag = match settings.default_mode {
         DefaultMode::Proxy => "proxy",
         DefaultMode::Direct => "direct",
+        DefaultMode::Block => "block",
     };
 
     // Rule-set references for GFW-list style bypass (downloaded separately).
@@ -280,7 +281,7 @@ mod tests {
                 "uuid": "some-uuid",
             }),
             rules_files: vec![],
-            enabled: true,
+            ..Default::default()
         }
     }
 
@@ -291,6 +292,7 @@ mod tests {
             http_port: Some(10809),
             log_level: "warn".into(),
             auto_connect: false,
+            ..Settings::default()
         }
     }
 
