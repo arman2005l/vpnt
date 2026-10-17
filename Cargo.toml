@@ -1,0 +1,35 @@
+[package]
+name = "vpnt"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vpnt"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.38.0", features = ["full"] }
+ratatui = { version = "0.27.0", features = ["crossterm"] }
+crossterm = { version = "0.27.0" }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = { version = "1.0.117" }
+anyhow = { version = "1.0.86" }
+reqwest = { version = "0.12.5", default-features = false, features = ["rustls-tls", "json"] }
+url = { version = "2.5.2" }
+base64 = { version = "0.22.1" }
+directories = { version = "5.0.1" }
+tracing = { version = "0.1.40" }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-appender = { version = "0.2.3" }
+uuid = { version = "1.9.1", features = ["v4"] }
+tokio-util = { version = "0.7.11" }
+chrono = { version = "0.4.38", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.38.0", features = ["full", "test-util"] }
+
+tempfile = "3.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+base64 = "0.22"
