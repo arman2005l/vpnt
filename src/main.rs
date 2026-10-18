@@ -1,6 +1,7 @@
 mod config;
 mod core;
 mod gen;
+mod net;
 mod parse;
 mod platform;
 mod ui;

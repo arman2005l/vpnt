@@ -1,7 +1,9 @@
 //! Link-parsing entry point and shared helpers.
 
+pub mod hysteria2;
 pub mod ss;
 pub mod trojan;
+pub mod tuic;
 pub mod vless;
 pub mod vmess;
 
@@ -23,6 +25,10 @@ pub fn parse_link(raw: &str) -> Result<(String, Value)> {
         trojan::parse(raw)
     } else if raw.starts_with("ss://") {
         ss::parse(raw)
+    } else if raw.starts_with("hysteria2://") || raw.starts_with("hy2://") {
+        hysteria2::parse(raw)
+    } else if raw.starts_with("tuic://") {
+        tuic::parse(raw)
     } else if raw.starts_with('{') {
         parse_raw_json(raw)
     } else {

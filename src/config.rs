@@ -16,6 +16,8 @@ pub struct ProxyConfig {
     pub outbound: serde_json::Value,
     #[serde(default)]
     pub rules_files: Vec<RulesFile>,
+    #[serde(default)]
+    pub last_tcp_ms: Option<u64>,
 }
 
 impl Default for ProxyConfig {
@@ -30,6 +32,7 @@ impl Default for ProxyConfig {
             stream_settings: None,
             outbound: serde_json::Value::Null,
             rules_files: Vec::new(),
+            last_tcp_ms: None,
         }
     }
 }

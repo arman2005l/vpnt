@@ -10,13 +10,13 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState,
-        Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, TableState,
         Table, Tabs, Wrap,
     },
 };
 
 use crate::core::Status;
-use crate::ui::app::{AppState, Tab};
+use crate::ui::app::{AppState, InputMode, Tab};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 // A single accent hue (teal-ish) plus a neutral ramp.  All colours are named
@@ -171,68 +171,129 @@ pub fn status_panel(frame: &mut Frame, area: Rect, state: &AppState) {
 // ── Proxy list ────────────────────────────────────────────────────────────────
 
 pub fn proxy_list(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = accent_block("Proxies");
+    let block = accent_block("Configs");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let prompt_height = if state.input_mode == InputMode::Normal { 1 } else { 3 };
+    let [list_area, prompt_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(prompt_height)])
+        .areas(inner);
+    config_prompt(frame, prompt_area, state);
+
     if state.store.proxies.is_empty() {
         frame.render_widget(
-            Paragraph::new("No proxies loaded.  Paste a link on the Settings tab.")
+            Paragraph::new("No configs yet.  Press a to add a share link or outbound JSON.")
                 .style(Style::default().fg(palette::MUTED))
                 .alignment(Alignment::Center),
-            inner,
+            list_area,
         );
         return;
     }
 
-    let active_name = state
-        .store
-        .settings
-        .active_config_id
-        .as_deref()
-        .unwrap_or("");
+    let active_id = state.active_proxy().map(|p| p.id.clone()).unwrap_or_default();
 
-    let items: Vec<ListItem> = state
+    let header = Row::new(vec!["", "Name", "Protocol", "Host:Port", "TCP"])
+        .style(Style::default().fg(palette::MUTED).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = state
         .store
         .proxies
         .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let is_active = p.name == active_name;
-            let is_cursor = i == state.proxy_cursor;
-
-            let bullet = if is_active { "● " } else { "○ " };
+        .map(|p| {
+            let is_active = !active_id.is_empty() && p.id == active_id;
+            let bullet = if is_active { "●" } else { "○" };
             let bullet_color = if is_active { palette::ACCENT } else { palette::BORDER };
-
-            let name_style = if is_cursor {
-                Style::default()
-                    .fg(palette::ACCENT)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(palette::RAISED)
-            } else {
-                Style::default().fg(palette::BODY)
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(bullet, Style::default().fg(bullet_color)),
-                Span::styled(p.name.clone(), name_style),
-                Span::styled(
-                    format!("  {}", proxy_protocol_label(p)),
-                    Style::default().fg(palette::MUTED),
-                ),
-            ]))
+            let ping = p
+                .last_tcp_ms
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "-".into());
+            Row::new(vec![
+                Cell::from(bullet).style(Style::default().fg(bullet_color)),
+                Cell::from(p.name.clone()).style(Style::default().fg(palette::BODY)),
+                Cell::from(proxy_protocol_label(p)).style(Style::default().fg(palette::MUTED)),
+                Cell::from(format!("{}:{}", p.address, p.port))
+                    .style(Style::default().fg(palette::MUTED)),
+                Cell::from(ping).style(Style::default().fg(palette::BODY)),
+            ])
         })
         .collect();
 
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.proxy_cursor));
+    let mut table_state = TableState::default();
+    table_state.select(Some(state.proxy_cursor));
 
-    frame.render_stateful_widget(
-        List::new(items)
-            .highlight_style(Style::default().bg(palette::RAISED))
-            .style(Style::default().bg(palette::SURFACE)),
-        inner,
-        &mut list_state,
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Percentage(35),
+            Constraint::Length(12),
+            Constraint::Percentage(35),
+            Constraint::Length(9),
+        ],
+    )
+    .header(header)
+    .highlight_style(
+        Style::default()
+            .fg(palette::ACCENT)
+            .bg(palette::RAISED)
+            .add_modifier(Modifier::BOLD),
+    )
+    .style(Style::default().bg(palette::SURFACE))
+    .column_spacing(1);
+
+    frame.render_stateful_widget(table, list_area, &mut table_state);
+}
+
+fn config_prompt(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (title, body) = match &state.input_mode {
+        InputMode::Normal => {
+            let hint = if state.pinging { "pinging…  " } else { "" };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{hint}a add  e rename  d delete  t ping all  Enter set active"
+                ))
+                .style(Style::default().fg(palette::MUTED)),
+                area,
+            );
+            return;
+        }
+        InputMode::Adding(buf) => (
+            " Add: paste link or outbound JSON (Enter save, Esc cancel) ",
+            format!("{buf}▏"),
+        ),
+        InputMode::Renaming(buf) => (" Rename (Enter save, Esc cancel) ", format!("{buf}▏")),
+        InputMode::ConfirmDelete => {
+            let name = state
+                .store
+                .proxies
+                .get(state.proxy_cursor)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            (" Confirm delete ", format!("Delete \"{name}\"? y = yes, any other key = no"))
+        }
+    };
+
+    let width = area.width.saturating_sub(2) as usize;
+    let chars: Vec<char> = body.chars().collect();
+    let shown: String = if chars.len() > width && width > 0 {
+        chars[chars.len() - width..].iter().collect()
+    } else {
+        body
+    };
+
+    frame.render_widget(
+        Paragraph::new(shown)
+            .style(Style::default().fg(palette::BODY))
+            .block(
+                Block::default()
+                    .title(Span::styled(title, Style::default().fg(palette::WARNING)))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(palette::ACCENT_DIM)),
+            ),
+        area,
     );
 }
 
@@ -244,6 +305,9 @@ fn proxy_protocol_label(p: &crate::config::ProxyConfig) -> &'static str {
         "vmess"  => "VMess",
         "trojan" => "Trojan",
         "ss"     => "Shadowsocks",
+        "shadowsocks" => "Shadowsocks",
+        "hysteria2" => "Hysteria2",
+        "tuic"   => "TUIC",
         _        => "Unknown",
     }
 }
@@ -416,7 +480,8 @@ pub fn help_overlay(frame: &mut Frame, area: Rect) {
         ("q / Ctrl-q / Ctrl-c", "Quit"),
         ("Tab / Shift-Tab",      "Switch tabs"),
         ("j / ↓  k / ↑",        "Move cursor"),
-        ("Enter",                "Activate selected proxy"),
+        ("Enter",                "Set selected config active"),
+        ("a / e / d / t",        "Configs: add/rename/delete/ping"),
         ("s",                    "Start / stop proxy"),
         ("r",                    "Restart proxy"),
         ("?  / F1",              "Toggle this help"),

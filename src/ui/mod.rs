@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -24,7 +27,7 @@ use tracing::error;
 
 use crate::core::Supervisor;
 
-use self::app::{Action, AppState};
+use self::app::{Action, AppState, InputMode, Tab};
 
 /// Tick rate: how often we redraw even without an input event.
 const TICK_MS: u64 = 250;
@@ -47,7 +50,7 @@ pub async fn run(supervisor: Supervisor, data_dir: std::path::PathBuf) -> Result
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -58,6 +61,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
     )?;
     terminal.show_cursor()?;
     Ok(())
@@ -84,7 +88,8 @@ async fn event_loop(
         // ── Poll for input or tick ────────────────────────────────────────
         let action = if event::poll(tick)? {
             match event::read()? {
-                Event::Key(key) => map_key(key),
+                Event::Key(key) if key.kind == KeyEventKind::Press => map_key(key, &state),
+                Event::Paste(text) => Some(Action::Paste(text)),
                 Event::Resize(_, _) => Some(Action::Redraw),
                 _ => None,
             }
@@ -109,12 +114,42 @@ async fn event_loop(
 
 // ── Key → Action mapping ──────────────────────────────────────────────────────
 
-fn map_key(key: event::KeyEvent) -> Option<Action> {
+fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
     // Ctrl-C / Ctrl-Q / q always quit.
     if matches!(key.modifiers, KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
     {
         return Some(Action::Quit);
+    }
+
+    match state.input_mode {
+        InputMode::Adding(_) | InputMode::Renaming(_) => {
+            return match key.code {
+                KeyCode::Enter => Some(Action::InputSubmit),
+                KeyCode::Esc => Some(Action::InputCancel),
+                KeyCode::Backspace => Some(Action::InputBackspace),
+                KeyCode::Char(c) => Some(Action::InputChar(c)),
+                _ => None,
+            };
+        }
+        InputMode::ConfirmDelete => {
+            return match key.code {
+                KeyCode::Esc => Some(Action::InputCancel),
+                KeyCode::Char(c) => Some(Action::InputChar(c)),
+                _ => Some(Action::InputChar('n')),
+            };
+        }
+        InputMode::Normal => {}
+    }
+
+    if state.active_tab == Tab::Proxies {
+        match key.code {
+            KeyCode::Char('a') => return Some(Action::AddConfig),
+            KeyCode::Char('e') => return Some(Action::RenameConfig),
+            KeyCode::Char('d') => return Some(Action::DeleteConfig),
+            KeyCode::Char('t') => return Some(Action::PingAll),
+            _ => {}
+        }
     }
 
     match key.code {

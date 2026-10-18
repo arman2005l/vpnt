@@ -168,3 +168,74 @@ pub async fn probe_host(host: &str, port: u16) -> Result<ProbeResult> {
 
     tcp_probe(addr).await
 }
+
+// ── TCP ping ──────────────────────────────────────────────────────────────────
+
+/// Default timeout for `tcp_ping` / `ping_all`.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One target for `ping_all`: an opaque id plus `host:port`.
+#[derive(Debug, Clone)]
+pub struct PingTarget {
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Measure TCP connect time (DNS lookup included) to `host:port`.
+/// Returns `None` on DNS failure, refusal or timeout.
+pub async fn tcp_ping(host: &str, port: u16, timeout: Duration) -> Option<u64> {
+    let target = format!("{host}:{port}");
+    let start = Instant::now();
+    match tokio::time::timeout(timeout, TcpStream::connect(target.clone())).await {
+        Ok(Ok(_stream)) => {
+            let ms = start.elapsed().as_millis() as u64;
+            debug!("ping {target} ok {ms} ms");
+            Some(ms)
+        }
+        Ok(Err(e)) => {
+            debug!("ping {target} failed: {e}");
+            None
+        }
+        Err(_) => {
+            debug!("ping {target} timed out");
+            None
+        }
+    }
+}
+
+/// Ping every target concurrently. Results come back in input order.
+pub async fn ping_all(targets: Vec<PingTarget>, timeout: Duration) -> Vec<(String, Option<u64>)> {
+    let mut handles = Vec::new();
+    for t in targets {
+        handles.push(tokio::spawn(async move {
+            let ms = tcp_ping(&t.host, t.port, timeout).await;
+            (t.id, ms)
+        }));
+    }
+    let mut out = Vec::new();
+    for handle in handles {
+        if let Ok(result) = handle.await {
+            out.push(result);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ping_local_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let results = ping_all(
+            vec![PingTarget { id: "a".into(), host: "127.0.0.1".into(), port }],
+            PING_TIMEOUT,
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_some());
+    }
+}
