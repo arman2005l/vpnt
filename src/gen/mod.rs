@@ -43,6 +43,7 @@ pub fn build(proxy: &ProxyConfig, settings: &Settings) -> Result<Value> {
     let inbounds = build_inbounds(settings);
     let outbounds = build_outbounds(proxy);
     let route = build_route(proxy, settings);
+    let experimental = build_experimental();
 
     Ok(json!({
         "log":       log,
@@ -50,7 +51,29 @@ pub fn build(proxy: &ProxyConfig, settings: &Settings) -> Result<Value> {
         "inbounds":  inbounds,
         "outbounds": outbounds,
         "route":     route,
+        "experimental": experimental,
     }))
+}
+
+// ── Experimental (Clash API) ──────────────────────────────────────────────────
+
+/// Clash API on 127.0.0.1 with a random free port and a random secret.
+/// `crate::clash::ClashApi::from_config` reads these back from config.json.
+fn build_experimental() -> Value {
+    let port = pick_free_port().unwrap_or(9090);
+    let secret = uuid::Uuid::new_v4().simple().to_string();
+    json!({
+        "clash_api": {
+            "external_controller": format!("127.0.0.1:{port}"),
+            "secret": secret,
+        }
+    })
+}
+
+fn pick_free_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+    Some(port)
 }
 
 // ── Log ───────────────────────────────────────────────────────────────────────

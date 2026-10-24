@@ -11,12 +11,13 @@ use ratatui::{
     widgets::{
         Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState,
         Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, TableState,
-        Table, Tabs, Wrap,
+        Sparkline, Table, Tabs, Wrap,
     },
 };
 
 use crate::core::Status;
 use crate::ui::app::{AppState, InputMode, Tab};
+use crate::ui::dashboard::{format_bytes, format_uptime, Probe};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 // A single accent hue (teal-ish) plus a neutral ramp.  All colours are named
@@ -101,71 +102,157 @@ pub fn tab_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 // ── Status panel ──────────────────────────────────────────────────────────────
 
 pub fn status_panel(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = accent_block("Status");
+    let block = accent_block("Dashboard");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows = Layout::default()
+    let dash = &state.dashboard;
+    let connected = matches!(state.proc_status, Status::Running(_)) && dash.connected_at.is_some();
+
+    let [info_area, body_area] = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
+        .areas(inner);
 
-    // Process status
+    let label = |s: &'static str| Span::styled(format!("{s:<10}"), Style::default().fg(palette::MUTED));
+    let value = |s: String| Span::styled(s, Style::default().fg(palette::BODY));
+
     let sc = status_color(&state.proc_status);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Process  ", Style::default().fg(palette::MUTED)),
-            Span::styled(state.status_line(), Style::default().fg(sc).add_modifier(Modifier::BOLD)),
-        ])),
-        rows[0],
-    );
-
-    // Active proxy
-    let proxy_name = state
+    let status_text = if connected { "Connected".to_string() } else { match &state.proc_status {
+        Status::Failed(msg) => format!("Disconnected ({msg})"),
+        _ => "Disconnected".to_string(),
+    }};
+    let config_name = state
         .active_proxy()
-        .map(|p| p.name.as_str())
-        .unwrap_or("—");
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Proxy    ", Style::default().fg(palette::MUTED)),
-            Span::styled(proxy_name, Style::default().fg(palette::BODY)),
-        ])),
-        rows[1],
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "(none, select one on Configs)".into());
+    let uptime = dash
+        .uptime()
+        .filter(|_| connected)
+        .map(format_uptime)
+        .unwrap_or_else(|| "-".into());
+
+    let info = vec![
+        Line::from(vec![
+            label("Status"),
+            Span::styled(status_text, Style::default().fg(sc).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![label("Config"), value(config_name)]),
+        Line::from(vec![label("Uptime"), value(uptime)]),
+    ];
+    frame.render_widget(Paragraph::new(info), info_area);
+
+    if !connected {
+        frame.render_widget(
+            Paragraph::new("Disconnected.  Press s to connect.")
+                .style(Style::default().fg(palette::MUTED))
+                .alignment(Alignment::Center),
+            body_area,
+        );
+        return;
+    }
+
+    let [spark_area, stats_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(0)])
+        .areas(body_area);
+    let [down_area, up_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(spark_area);
+
+    let down: Vec<u64> = dash.down_history.iter().copied().collect();
+    let up: Vec<u64> = dash.up_history.iter().copied().collect();
+    render_spark(
+        frame,
+        down_area,
+        &format!("↓ {}/s", format_bytes(dash.current.down)),
+        &down,
+        palette::ACCENT,
+    );
+    render_spark(
+        frame,
+        up_area,
+        &format!("↑ {}/s", format_bytes(dash.current.up)),
+        &up,
+        palette::WARNING,
     );
 
-    // SOCKS / HTTP ports from settings
-    let socks = state
-        .store
-        .settings
-        .socks_port
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "off".into());
-    let http = state
-        .store
-        .settings
-        .http_port
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "off".into());
+    let [stats_left, stats_right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(stats_area);
+
+    let latency = match &dash.latency_ms {
+        Probe::Ok(ms) => format!("{ms} ms"),
+        Probe::Pending => "measuring…".into(),
+        Probe::Failed(e) => format!("failed: {e}"),
+        Probe::Idle => "-".into(),
+    };
+    let exit_ip = match &dash.exit_ip {
+        Probe::Ok(ip) => ip.clone(),
+        Probe::Pending => "fetching…".into(),
+        Probe::Failed(e) => format!("failed: {e}"),
+        Probe::Idle => "-".into(),
+    };
+    let conns = &dash.connections;
+    let stats = vec![
+        Line::from(vec![
+            label("Session"),
+            value(format!(
+                "↓ {}  ↑ {}",
+                format_bytes(conns.download_total),
+                format_bytes(conns.upload_total)
+            )),
+        ]),
+        Line::from(vec![label("Exit IP"), value(exit_ip)]),
+        Line::from(vec![label("Latency"), value(latency)]),
+        Line::from(vec![label("Conns"), value(conns.count.to_string())]),
+        Line::from(""),
+        Line::from(Span::styled("r refresh exit IP / latency", Style::default().fg(palette::MUTED))),
+    ];
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("SOCKS5   ", Style::default().fg(palette::MUTED)),
-            Span::styled(format!("127.0.0.1:{socks}"), Style::default().fg(palette::BODY)),
-        ])),
-        rows[2],
+        Paragraph::new(stats)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(palette::BORDER))),
+        stats_left,
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("HTTP     ", Style::default().fg(palette::MUTED)),
-            Span::styled(format!("127.0.0.1:{http}"), Style::default().fg(palette::BODY)),
-        ])),
-        rows[3],
-    );
+
+    let rows: Vec<Row> = conns
+        .per_process
+        .iter()
+        .take(5)
+        .map(|(name, count)| {
+            Row::new(vec![
+                Cell::from(name.clone()).style(Style::default().fg(palette::BODY)),
+                Cell::from(count.to_string()).style(Style::default().fg(palette::ACCENT)),
+            ])
+        })
+        .collect();
+    let table = Table::new(rows, [Constraint::Min(10), Constraint::Length(6)])
+        .header(
+            Row::new(vec!["Top apps", "Conns"])
+                .style(Style::default().fg(palette::MUTED).add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(palette::BORDER)))
+        .column_spacing(1);
+    frame.render_widget(table, stats_right);
+}
+
+fn render_spark(frame: &mut Frame, area: Rect, title: &str, data: &[u64], color: Color) {
+    let max = data.iter().copied().max().unwrap_or(0).max(1);
+    let spark = Sparkline::default()
+        .block(
+            Block::default()
+                .title(Span::styled(format!(" {title} "), Style::default().fg(color)))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(palette::BORDER)),
+        )
+        .data(data)
+        .max(max)
+        .style(Style::default().fg(color));
+    frame.render_widget(spark, area);
 }
 
 // ── Proxy list ────────────────────────────────────────────────────────────────
@@ -483,7 +570,8 @@ pub fn help_overlay(frame: &mut Frame, area: Rect) {
         ("Enter",                "Set selected config active"),
         ("a / e / d / t",        "Configs: add/rename/delete/ping"),
         ("s",                    "Start / stop proxy"),
-        ("r",                    "Restart proxy"),
+        ("r",                    "Dashboard: refresh IP/latency"),
+        ("R / r (other tabs)",   "Restart proxy"),
         ("?  / F1",              "Toggle this help"),
     ];
 

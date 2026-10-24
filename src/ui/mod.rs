@@ -8,6 +8,7 @@
 
 pub mod app;
 pub use app::App;
+pub mod dashboard;
 pub mod widgets;
 
 use std::io;
@@ -102,7 +103,7 @@ async fn event_loop(
         if let Some(act) = action {
             if act == Action::Quit {
                 // Attempt clean shutdown; ignore errors here.
-                let _ = state.supervisor.stop().await;
+                state.shutdown().await;
                 break;
             }
             state.handle(act).await;
@@ -150,6 +151,10 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
             KeyCode::Char('t') => return Some(Action::PingAll),
             _ => {}
         }
+    }
+
+    if state.active_tab == Tab::Status && key.code == KeyCode::Char('r') {
+        return Some(Action::Refresh);
     }
 
     match key.code {

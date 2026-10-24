@@ -1,0 +1,43 @@
+{
+  "downloadTotal": 1048576,
+  "uploadTotal": 65536,
+  "connections": [
+    {
+      "id": "a1",
+      "metadata": {
+        "network": "tcp",
+        "type": "tun",
+        "sourceIP": "172.19.0.1",
+        "destinationPort": "443",
+        "host": "www.example.com",
+        "processPath": "/usr/lib/firefox/firefox"
+      },
+      "upload": 100,
+      "download": 2000,
+      "start": "2026-10-24T10:00:00Z",
+      "chains": ["proxy"],
+      "rule": "final",
+      "rulePayload": ""
+    },
+    {
+      "id": "a2",
+      "metadata": { "network": "tcp", "host": "cdn.example.com", "processPath": "/usr/lib/firefox/firefox" },
+      "upload": 10, "download": 20, "chains": ["proxy"]
+    },
+    {
+      "id": "a3",
+      "metadata": { "network": "udp", "host": "", "processPath": "/usr/bin/curl" },
+      "upload": 1, "download": 2, "chains": ["direct"]
+    },
+    {
+      "id": "a4",
+      "metadata": { "network": "tcp", "host": "api.example.com", "processPath": "" },
+      "upload": 1, "download": 2, "chains": ["proxy"]
+    },
+    {
+      "id": "a5",
+      "metadata": { "network": "tcp", "host": "x.example.com" },
+      "upload": 1, "download": 2, "chains": ["proxy"]
+    }
+  ]
+}

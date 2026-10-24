@@ -13,6 +13,7 @@ use crate::core::{Status, Supervisor};
 use crate::gen;
 use crate::net;
 use crate::parse;
+use crate::ui::dashboard::{DashUpdate, DashboardState, Monitor, MonitorTargets, Probe};
 
 /// How long a status-line notice stays visible.
 const NOTICE_TTL: Duration = Duration::from_secs(6);
@@ -33,6 +34,8 @@ pub enum Action {
     NextTab,
     PrevTab,
     ToggleHelp,
+    /// Dashboard: re-measure exit IP and latency.
+    Refresh,
     /// Configs tab: open the "add config" prompt.
     AddConfig,
     /// Configs tab: open the rename prompt for the selected config.
@@ -74,7 +77,7 @@ impl Tab {
 
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Status   => "Status",
+            Tab::Status   => "Dashboard",
             Tab::Proxies  => "Configs",
             Tab::Settings => "Settings",
             Tab::Logs     => "Logs",
@@ -124,6 +127,11 @@ pub struct AppState {
     pub pinging: bool,
     ping_tx: mpsc::UnboundedSender<Vec<(String, Option<u64>)>>,
     ping_rx: mpsc::UnboundedReceiver<Vec<(String, Option<u64>)>>,
+    /// Live dashboard data; reset on every connect/disconnect.
+    pub dashboard: DashboardState,
+    monitor: Option<Monitor>,
+    dash_tx: mpsc::UnboundedSender<DashUpdate>,
+    dash_rx: mpsc::UnboundedReceiver<DashUpdate>,
 }
 
 impl AppState {
@@ -146,6 +154,7 @@ impl AppState {
             }
         }
         let (ping_tx, ping_rx) = mpsc::unbounded_channel();
+        let (dash_tx, dash_rx) = mpsc::unbounded_channel();
 
         Self {
             supervisor,
@@ -162,6 +171,10 @@ impl AppState {
             pinging: false,
             ping_tx,
             ping_rx,
+            dashboard: DashboardState::default(),
+            monitor: None,
+            dash_tx,
+            dash_rx,
         }
     }
 
@@ -183,6 +196,7 @@ impl AppState {
             Action::PrevTab => self.active_tab = self.active_tab.prev(),
 
             Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::Refresh => self.refresh_dashboard(),
 
             Action::AddConfig => {
                 if self.active_tab == Tab::Proxies {
@@ -224,8 +238,14 @@ impl AppState {
     // ── Tick ──────────────────────────────────────────────────────────────
 
     async fn on_tick(&mut self) {
-        self.proc_status = self.supervisor.status().await;
         self.supervisor.poll().await;
+        self.proc_status = self.supervisor.status().await;
+        if self.monitor.is_some() && !matches!(self.proc_status, Status::Running(_)) {
+            self.stop_monitor();
+        }
+        while let Ok(update) = self.dash_rx.try_recv() {
+            self.dashboard.apply(update);
+        }
         while let Ok(results) = self.ping_rx.try_recv() {
             self.apply_ping_results(results);
         }
@@ -398,10 +418,12 @@ impl AppState {
             self.notice = Some(format!("Start failed: {e}"));
         } else {
             self.proc_status = self.supervisor.status().await;
+            self.start_monitor();
         }
     }
 
     async fn stop_proxy(&mut self) {
+        self.stop_monitor();
         if let Err(e) = self.supervisor.stop().await {
             self.notice = Some(format!("Stop failed: {e}"));
         } else {
@@ -410,10 +432,53 @@ impl AppState {
     }
 
     async fn restart_proxy(&mut self) {
+        self.stop_monitor();
         if let Err(e) = self.supervisor.restart().await {
             self.notice = Some(format!("Restart failed: {e}"));
         } else {
             self.proc_status = self.supervisor.status().await;
+            self.start_monitor();
+        }
+    }
+
+    /// Disconnect before quitting so the monitor tasks and sing-box stop.
+    pub async fn shutdown(&mut self) {
+        self.stop_proxy().await;
+    }
+
+    // ── Dashboard monitor ─────────────────────────────────────────────────
+
+    fn start_monitor(&mut self) {
+        self.stop_monitor();
+        if !matches!(self.proc_status, Status::Running(_)) {
+            return;
+        }
+        let generation = self.dashboard.begin_session();
+        let path = self.data_dir.join(gen::CONFIG_FILENAME);
+        match MonitorTargets::from_config_file(&path) {
+            Ok(targets) => {
+                self.monitor = Some(Monitor::start(targets, generation, self.dash_tx.clone()));
+                self.dashboard.exit_ip = Probe::Pending;
+                self.dashboard.latency_ms = Probe::Pending;
+            }
+            Err(e) => self.set_notice(format!("Dashboard unavailable: {e:#}")),
+        }
+    }
+
+    fn stop_monitor(&mut self) {
+        self.monitor = None;
+        self.dashboard.end_session();
+    }
+
+    fn refresh_dashboard(&mut self) {
+        match self.monitor.as_mut() {
+            Some(monitor) => {
+                self.dashboard.exit_ip = Probe::Pending;
+                self.dashboard.latency_ms = Probe::Pending;
+                monitor.refresh();
+                self.set_notice("Refreshing exit IP and latency…");
+            }
+            None => self.set_notice("Not connected."),
         }
     }
 

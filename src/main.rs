@@ -1,3 +1,4 @@
+mod clash;
 mod config;
 mod core;
 mod gen;

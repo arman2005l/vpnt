@@ -32,8 +32,11 @@ pub fn parse_link(raw: &str) -> Result<(String, Value)> {
     } else if raw.starts_with('{') {
         parse_raw_json(raw)
     } else {
-        let scheme_end = raw.find("://").unwrap_or(raw.len().min(20));
-        bail!("Unsupported link scheme: {}", &raw[..scheme_end]);
+        let scheme: String = match raw.find("://") {
+            Some(end) => raw[..end].chars().take(20).collect(),
+            None => raw.chars().take(20).collect(),
+        };
+        bail!("Unsupported link scheme: {scheme}");
     }
 }
 
@@ -174,5 +177,11 @@ mod tests {
     #[test]
     fn test_unsupported_scheme() {
         assert!(parse_link("http://example.com").is_err());
+    }
+
+    #[test]
+    fn test_garbage_non_ascii_does_not_panic() {
+        assert!(parse_link("ççççççççççççççççççççç").is_err());
+        assert!(parse_link("not a link").is_err());
     }
 }

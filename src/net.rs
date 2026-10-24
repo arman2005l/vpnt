@@ -174,6 +174,63 @@ pub async fn probe_host(host: &str, port: u16) -> Result<ProbeResult> {
 /// Default timeout for `tcp_ping` / `ping_all`.
 pub const PING_TIMEOUT: Duration = Duration::from_secs(3);
 
+// ── Exit IP ───────────────────────────────────────────────────────────────────
+
+/// Plain-text "what is my IP" endpoint.
+pub const EXIT_IP_URL: &str = "https://api.ipify.org";
+
+/// Timeout for one exit-IP request through the local proxy.
+pub const EXIT_IP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Find the local HTTP-capable inbound in a generated sing-box config and
+/// return it as a proxy URL (`http://127.0.0.1:<port>`).
+/// Prefers a `mixed` inbound, falls back to `http`.
+pub fn local_http_proxy_url(config: &serde_json::Value) -> Option<String> {
+    let inbounds = config.get("inbounds")?.as_array()?;
+    for wanted in ["mixed", "http"] {
+        for inbound in inbounds {
+            if inbound.get("type").and_then(|t| t.as_str()) != Some(wanted) {
+                continue;
+            }
+            let Some(port) = inbound.get("listen_port").and_then(|p| p.as_u64()) else {
+                continue;
+            };
+            let listen = inbound
+                .get("listen")
+                .and_then(|l| l.as_str())
+                .filter(|l| !l.is_empty() && *l != "0.0.0.0" && *l != "::")
+                .unwrap_or("127.0.0.1");
+            let host = if listen.contains(':') { format!("[{listen}]") } else { listen.to_string() };
+            return Some(format!("http://{host}:{port}"));
+        }
+    }
+    None
+}
+
+/// Fetch the public exit IP through `proxy_url` (an HTTP proxy), so the result
+/// does not depend on TUN routing.
+pub async fn fetch_exit_ip(proxy_url: &str) -> Result<String> {
+    let proxy = reqwest::Proxy::all(proxy_url).context("invalid local proxy URL")?;
+    let client = Client::builder()
+        .proxy(proxy)
+        .timeout(EXIT_IP_TIMEOUT)
+        .user_agent(concat!("vpnt/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to build HTTP client")?;
+    let body = client
+        .get(EXIT_IP_URL)
+        .send()
+        .await
+        .context("exit IP request failed")?
+        .error_for_status()?
+        .text()
+        .await?;
+    let ip = body.trim();
+    ip.parse::<std::net::IpAddr>()
+        .with_context(|| format!("unexpected exit IP response ({} bytes)", ip.len()))?;
+    Ok(ip.to_string())
+}
+
 /// One target for `ping_all`: an opaque id plus `host:port`.
 #[derive(Debug, Clone)]
 pub struct PingTarget {
@@ -237,5 +294,25 @@ mod tests {
         .await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1.is_some());
+    }
+
+    #[test]
+    fn local_proxy_prefers_mixed_then_http() {
+        let mixed = serde_json::json!({ "inbounds": [
+            { "type": "http", "listen": "127.0.0.1", "listen_port": 1 },
+            { "type": "mixed", "listen": "127.0.0.1", "listen_port": 2 }
+        ]});
+        assert_eq!(local_http_proxy_url(&mixed).as_deref(), Some("http://127.0.0.1:2"));
+        let none = serde_json::json!({ "inbounds": [{ "type": "tun" }] });
+        assert_eq!(local_http_proxy_url(&none), None);
+    }
+
+    #[test]
+    fn local_proxy_found_in_generated_config() {
+        let proxy = crate::ui::app::proxy_from_link("hy2://pass@1.2.3.4:443#t").unwrap();
+        let settings = crate::config::Settings::default();
+        let config = crate::gen::build(&proxy, &settings).unwrap();
+        assert!(local_http_proxy_url(&config).is_some());
+        assert!(crate::clash::ClashApi::from_config(&config).is_ok());
     }
 }
