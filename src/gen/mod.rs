@@ -12,7 +12,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::config::{DefaultMode, ProxyConfig, RuleAction, RuleKind, Settings};
+use crate::config::{
+    load_rules, AppRuleKind, DefaultMode, ProxyConfig, RoutingMode, RuleAction, RuleKind,
+    RulesConfig, Settings,
+};
 
 /// Path relative to `data_dir` where the generated config is written.
 pub const CONFIG_FILENAME: &str = "config.json";
@@ -20,29 +23,51 @@ pub const CONFIG_FILENAME: &str = "config.json";
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Build a complete sing-box config and write it atomically to
-/// `data_dir/config.json`.  Returns the path written.
+/// `data_dir/config.json`.  User rules are read from `data_dir/rules.json`.
+/// Returns the path written.
 pub fn write_config(
     data_dir: &Path,
     proxy: &ProxyConfig,
     settings: &Settings,
 ) -> Result<std::path::PathBuf> {
-    let config = build(proxy, settings)?;
+    let rules = load_rules(data_dir).context("failed to load rules.json")?;
     let dest = data_dir.join(CONFIG_FILENAME);
-    let bytes = serde_json::to_vec_pretty(&config)
-        .context("failed to serialize sing-box config")?;
-    crate::config::atomic_write(&dest, &bytes)
-        .context("failed to write sing-box config")?;
+    write_config_to(&dest, proxy, settings, &rules)?;
     Ok(dest)
 }
 
-/// Build and return the sing-box config as a JSON value without writing it.
-/// Useful for tests and preview.
+/// Build a config with explicit `rules` and write it atomically to `dest`.
+pub fn write_config_to(
+    dest: &Path,
+    proxy: &ProxyConfig,
+    settings: &Settings,
+    rules: &RulesConfig,
+) -> Result<()> {
+    let config = build_with_rules(proxy, settings, rules)?;
+    let bytes = serde_json::to_vec_pretty(&config)
+        .context("failed to serialize sing-box config")?;
+    crate::config::atomic_write(dest, &bytes)
+        .context("failed to write sing-box config")?;
+    Ok(())
+}
+
+/// Build and return the sing-box config as a JSON value without writing it,
+/// using default rules (no user rules, `all_via_vpn`).
 pub fn build(proxy: &ProxyConfig, settings: &Settings) -> Result<Value> {
+    build_with_rules(proxy, settings, &RulesConfig::default())
+}
+
+/// Build the sing-box config with the given rules.json contents.
+pub fn build_with_rules(
+    proxy: &ProxyConfig,
+    settings: &Settings,
+    rules: &RulesConfig,
+) -> Result<Value> {
     let log = build_log(settings);
     let dns = build_dns();
     let inbounds = build_inbounds(settings);
     let outbounds = build_outbounds(proxy);
-    let route = build_route(proxy, settings);
+    let route = build_route(proxy, settings, rules);
     let experimental = build_experimental();
 
     Ok(json!({
@@ -93,39 +118,34 @@ fn build_log(settings: &Settings) -> Value {
 // ── DNS ───────────────────────────────────────────────────────────────────────
 
 fn build_dns() -> Value {
-    // Simple two-server setup:
-    //   - local:  system resolver for direct (private/CN) traffic
-    //   - remote: DNS-over-HTTPS via the proxy for everything else
-    // M1 does not use TUN so we rely on the OS resolver for local lookups.
+    // New-style (sing-box >= 1.12) servers:
+    //   - dns-remote: DoH through the proxy for everything else
+    //   - dns-local:  DoH sent direct, used for private names and for
+    //                 resolving outbound server addresses
     json!({
         "servers": [
             {
-                "tag":     "dns-remote",
-                "address": "https://1.1.1.1/dns-query",
-                "detour":  "proxy",
+                "type":   "https",
+                "tag":    "dns-remote",
+                "server": "1.1.1.1",
+                "detour": "proxy",
             },
             {
-                "tag":     "dns-local",
-                "address": "https://223.5.5.5/dns-query",
-                "detour":  "direct",
-            },
-            {
-                "tag":     "dns-block",
-                "address": "rcode://success",
+                "type":   "https",
+                "tag":    "dns-local",
+                "server": "223.5.5.5",
             },
         ],
         "rules": [
-            // Resolve private-range FQDNs locally.
-            { "rule_set": ["geosite-private"],   "server": "dns-local" },
-            // Proxy everything else.
+            { "rule_set": ["geosite-private"], "server": "dns-local" },
         ],
-        "final":             "dns-remote",
-        "independent_cache": true,
+        "final": "dns-remote",
     })
 }
 
 // ── Inbounds ──────────────────────────────────────────────────────────────────
 
+/// Sniffing is a route action since sing-box 1.11, so inbounds stay plain.
 fn build_inbounds(settings: &Settings) -> Value {
     let socks_port = settings.socks_port.unwrap_or(10808);
     let http_port = settings.http_port.unwrap_or(10809);
@@ -136,18 +156,12 @@ fn build_inbounds(settings: &Settings) -> Value {
             "tag":          "socks-in",
             "listen":       "127.0.0.1",
             "listen_port":  socks_port,
-            "sniff":        true,
-            "sniff_override_destination": true,
-            "users":        [],
         },
         {
             "type":         "http",
             "tag":          "http-in",
             "listen":       "127.0.0.1",
             "listen_port":  http_port,
-            "sniff":        true,
-            "sniff_override_destination": true,
-            "users":        [],
         },
     ])
 }
@@ -165,24 +179,23 @@ fn build_outbounds(proxy: &ProxyConfig) -> Value {
 
     // Built-in utility outbounds.
     list.push(json!({ "type": "direct", "tag": "direct" }));
-    list.push(json!({ "type": "block",  "tag": "block"  }));
-    list.push(json!({ "type": "dns",    "tag": "dns-out" }));
 
     json!(list)
 }
 
 // ── Route ─────────────────────────────────────────────────────────────────────
 
-fn build_route(proxy: &ProxyConfig, settings: &Settings) -> Value {
+fn build_route(proxy: &ProxyConfig, settings: &Settings, user: &RulesConfig) -> Value {
     let mut rules: Vec<Value> = Vec::new();
 
-    // 1. DNS hijack — must be first.
-    rules.push(json!({ "protocol": "dns",      "outbound": "dns-out" }));
+    // 1. Sniff first so domain rules see the real host, then hijack DNS.
+    rules.push(json!({ "action": "sniff" }));
+    rules.push(json!({ "protocol": "dns", "action": "hijack-dns" }));
 
-    // 2. Block ad/malware rule-sets (optional, non-fatal if absent).
+    // 2. Block ad/malware rule-sets.
     rules.push(json!({
-        "rule_set":  ["geosite-category-ads-all"],
-        "outbound":  "block",
+        "rule_set": ["geosite-category-ads-all"],
+        "action":   "reject",
     }));
 
     // 3. Direct: private addresses + LAN.
@@ -191,59 +204,65 @@ fn build_route(proxy: &ProxyConfig, settings: &Settings) -> Value {
         "outbound":      "direct",
     }));
 
-    // 4. User-defined per-domain / per-IP rules from the RulesFile list.
+    // 4. rules.json, in order.
+    for rule in &user.rules {
+        let mut entry = match rule.kind {
+            AppRuleKind::ProcessName => json!({ "process_name": [rule.value.as_str()] }),
+            AppRuleKind::DomainSuffix => json!({ "domain_suffix": [rule.value.as_str()] }),
+        };
+        apply_action(&mut entry, &rule.action);
+        rules.push(entry);
+    }
+
+    // 5. Legacy per-config rules from the RulesFile list.
     for rf in &proxy.rules_files {
         for rule in &rf.rules {
-            let entry = match rule.kind {
-                RuleKind::Domain => json!({
-                    "domain_suffix": [rule.pattern.as_str()],
-                    "outbound": action_tag(&rule.action),
-                }),
-                RuleKind::DomainFull => json!({
-                    "domain":   [rule.pattern.as_str()],
-                    "outbound": action_tag(&rule.action),
-                }),
-                RuleKind::IpCidr => json!({
-                    "ip_cidr":  [rule.pattern.as_str()],
-                    "outbound": action_tag(&rule.action),
-                }),
-                RuleKind::GeoSite => json!({
-                    "rule_set":  [format!("geosite-{}", rule.pattern)],
-                    "outbound":  action_tag(&rule.action),
-                }),
-                RuleKind::GeoIp => json!({
-                    "rule_set":  [format!("geoip-{}", rule.pattern)],
-                    "outbound":  action_tag(&rule.action),
-                }),
+            let mut entry = match rule.kind {
+                RuleKind::Domain => json!({ "domain_suffix": [rule.pattern.as_str()] }),
+                RuleKind::DomainFull => json!({ "domain": [rule.pattern.as_str()] }),
+                RuleKind::IpCidr => json!({ "ip_cidr": [rule.pattern.as_str()] }),
+                RuleKind::GeoSite => json!({ "rule_set": [format!("geosite-{}", rule.pattern)] }),
+                RuleKind::GeoIp => json!({ "rule_set": [format!("geoip-{}", rule.pattern)] }),
             };
+            apply_action(&mut entry, &rule.action);
             rules.push(entry);
         }
     }
 
-    // 5. Default final rule based on DefaultMode.
-    let final_tag = match settings.default_mode {
-        DefaultMode::Proxy => "proxy",
-        DefaultMode::Direct => "direct",
-        DefaultMode::Block => "block",
+    // 6. Final: only_listed_via_vpn sends everything else direct; otherwise
+    //    the legacy Settings.default_mode decides (Proxy by default).
+    let final_action = match user.default_mode {
+        RoutingMode::OnlyListedViaVpn => RuleAction::Direct,
+        RoutingMode::AllViaVpn => match settings.default_mode {
+            DefaultMode::Proxy => RuleAction::Proxy,
+            DefaultMode::Direct => RuleAction::Direct,
+            DefaultMode::Block => RuleAction::Block,
+        },
     };
-
-    // Rule-set references for GFW-list style bypass (downloaded separately).
-    // If the files don't exist sing-box skips them gracefully.
-    let rule_sets = build_rule_sets();
+    let final_tag = match final_action {
+        RuleAction::Proxy => "proxy",
+        RuleAction::Direct | RuleAction::Block => "direct",
+    };
+    if final_action == RuleAction::Block {
+        rules.push(json!({ "action": "reject" }));
+    }
 
     json!({
         "rules":     rules,
         "final":     final_tag,
-        "rule_set":  rule_sets,
+        "rule_set":  build_rule_sets(),
+        "find_process": true,
         "auto_detect_interface": true,
+        "default_domain_resolver": "dns-local",
     })
 }
 
-fn action_tag(action: &RuleAction) -> &'static str {
+/// sing-box >= 1.13 has no `block` outbound: block is the `reject` action.
+fn apply_action(entry: &mut Value, action: &RuleAction) {
     match action {
-        RuleAction::Proxy  => "proxy",
-        RuleAction::Direct => "direct",
-        RuleAction::Block  => "block",
+        RuleAction::Proxy => entry["outbound"] = json!("proxy"),
+        RuleAction::Direct => entry["outbound"] = json!("direct"),
+        RuleAction::Block => entry["action"] = json!("reject"),
     }
 }
 
@@ -289,7 +308,7 @@ fn build_rule_sets() -> Value {
 mod tests {
     use serde_json::json;
 
-    use crate::config::{DefaultMode, ProxyConfig, Settings};
+    use crate::config::{AppRule, DefaultMode, ProxyConfig, Settings};
 
     use super::*;
 
@@ -356,11 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn dns_hijack_rule_is_first() {
+    fn sniff_then_dns_hijack_come_first() {
         let cfg = build(&make_proxy(), &make_settings()).unwrap();
         let rules = cfg["route"]["rules"].as_array().unwrap();
-        assert_eq!(rules[0]["protocol"], "dns");
-        assert_eq!(rules[0]["outbound"], "dns-out");
+        assert_eq!(rules[0]["action"], "sniff");
+        assert_eq!(rules[1]["protocol"], "dns");
+        assert_eq!(rules[1]["action"], "hijack-dns");
     }
 
     #[test]
@@ -371,5 +391,104 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v["inbounds"].is_array());
+    }
+
+    #[test]
+    fn write_config_reads_rules_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = RulesConfig {
+            default_mode: RoutingMode::OnlyListedViaVpn,
+            rules: vec![AppRule {
+                kind: AppRuleKind::ProcessName,
+                value: "firefox".into(),
+                action: RuleAction::Proxy,
+            }],
+        };
+        crate::config::save_rules(dir.path(), &rules).unwrap();
+        let path = write_config(dir.path(), &make_proxy(), &make_settings()).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(v["route"]["final"], "direct");
+        let found = v["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["process_name"] == json!(["firefox"]) && r["outbound"] == "proxy");
+        assert!(found);
+    }
+
+    // ── Golden files (src/gen/golden/*.json) ──────────────────────────────
+    // Regenerate with: VPNT_UPDATE_GOLDEN=1 cargo test golden
+
+    fn golden_proxy() -> ProxyConfig {
+        ProxyConfig {
+            id: "golden".into(),
+            name: "golden".into(),
+            outbound: json!({
+                "type": "hysteria2",
+                "tag": "golden",
+                "server": "1.2.3.4",
+                "server_port": 443,
+                "password": "pw",
+                "tls": { "enabled": true, "server_name": "example.com" },
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn rule(kind: AppRuleKind, value: &str, action: RuleAction) -> AppRule {
+        AppRule { kind, value: value.into(), action }
+    }
+
+    fn check_golden(name: &str, rules: &RulesConfig) {
+        let mut cfg = build_with_rules(&golden_proxy(), &Settings::default(), rules).unwrap();
+        // Port and secret are random per build; pin them for comparison.
+        cfg["experimental"]["clash_api"] = json!({
+            "external_controller": "127.0.0.1:9090",
+            "secret": "SECRET",
+        });
+        let actual = serde_json::to_string_pretty(&cfg).unwrap() + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/gen/golden")
+            .join(format!("{name}.json"));
+        if std::env::var_os("VPNT_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &actual).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing golden {}: {e}", path.display()));
+        assert_eq!(actual, expected, "golden mismatch for {name}; rerun with VPNT_UPDATE_GOLDEN=1");
+    }
+
+    #[test]
+    fn golden_default_no_rules() {
+        check_golden("default_no_rules", &RulesConfig::default());
+    }
+
+    #[test]
+    fn golden_all_via_vpn_with_exceptions() {
+        let rules = RulesConfig {
+            default_mode: RoutingMode::AllViaVpn,
+            rules: vec![
+                rule(AppRuleKind::ProcessName, "steam", RuleAction::Direct),
+                rule(AppRuleKind::DomainSuffix, "ir", RuleAction::Direct),
+                rule(AppRuleKind::DomainSuffix, "doubleclick.net", RuleAction::Block),
+            ],
+        };
+        check_golden("all_via_vpn_exceptions", &rules);
+    }
+
+    #[test]
+    fn golden_only_listed_via_vpn() {
+        let rules = RulesConfig {
+            default_mode: RoutingMode::OnlyListedViaVpn,
+            rules: vec![
+                rule(AppRuleKind::ProcessName, "telegram-desktop", RuleAction::Proxy),
+                rule(AppRuleKind::ProcessName, "firefox", RuleAction::Proxy),
+                rule(AppRuleKind::DomainSuffix, "youtube.com", RuleAction::Proxy),
+                rule(AppRuleKind::ProcessName, "torrent", RuleAction::Block),
+            ],
+        };
+        check_golden("only_listed_via_vpn", &rules);
     }
 }

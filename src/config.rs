@@ -61,6 +61,26 @@ pub enum RuleAction {
     Block,
 }
 
+impl RuleAction {
+    /// Lowercase name used in rules.json, the generator and the UI.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RuleAction::Proxy => "proxy",
+            RuleAction::Direct => "direct",
+            RuleAction::Block => "block",
+        }
+    }
+
+    /// proxy -> direct -> block -> proxy.
+    pub fn cycle(&self) -> RuleAction {
+        match self {
+            RuleAction::Proxy => RuleAction::Direct,
+            RuleAction::Direct => RuleAction::Block,
+            RuleAction::Block => RuleAction::Proxy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub kind: RuleKind,
@@ -72,6 +92,148 @@ pub struct Rule {
 pub struct RulesFile {
     #[serde(default)]
     pub rules: Vec<Rule>,
+}
+
+// ── rules.json (see DESIGN.md) ────────────────────────────────────────────────
+
+pub const RULES_FILENAME: &str = "rules.json";
+
+/// `default_mode` in rules.json.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    #[default]
+    AllViaVpn,
+    OnlyListedViaVpn,
+}
+
+impl RoutingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoutingMode::AllViaVpn => "all_via_vpn",
+            RoutingMode::OnlyListedViaVpn => "only_listed_via_vpn",
+        }
+    }
+
+    pub fn toggle(self) -> RoutingMode {
+        match self {
+            RoutingMode::AllViaVpn => RoutingMode::OnlyListedViaVpn,
+            RoutingMode::OnlyListedViaVpn => RoutingMode::AllViaVpn,
+        }
+    }
+
+    /// Sensible action for a newly added rule: the opposite of the default.
+    pub fn new_rule_action(self) -> RuleAction {
+        match self {
+            RoutingMode::AllViaVpn => RuleAction::Direct,
+            RoutingMode::OnlyListedViaVpn => RuleAction::Proxy,
+        }
+    }
+}
+
+/// `kind` of a rules.json entry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppRuleKind {
+    ProcessName,
+    DomainSuffix,
+}
+
+impl AppRuleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AppRuleKind::ProcessName => "process_name",
+            AppRuleKind::DomainSuffix => "domain_suffix",
+        }
+    }
+}
+
+/// One rules.json entry: `{kind, value, action}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppRule {
+    pub kind: AppRuleKind,
+    pub value: String,
+    #[serde(with = "lowercase_action")]
+    pub action: RuleAction,
+}
+
+impl AppRule {
+    /// Parse the Apps-tab input. `app:NAME` / `domain:SUFFIX` force the kind;
+    /// otherwise anything that looks like a host name is a domain suffix.
+    pub fn from_input(text: &str, action: RuleAction) -> Option<AppRule> {
+        let text = text.trim();
+        let (kind, value) = if let Some(rest) = text.strip_prefix("app:") {
+            (AppRuleKind::ProcessName, rest.trim())
+        } else if let Some(rest) = text.strip_prefix("domain:") {
+            (AppRuleKind::DomainSuffix, rest.trim())
+        } else if looks_like_domain(text) {
+            (AppRuleKind::DomainSuffix, text)
+        } else {
+            (AppRuleKind::ProcessName, text)
+        };
+        let value = match kind {
+            AppRuleKind::DomainSuffix => value.trim_start_matches('.').to_ascii_lowercase(),
+            AppRuleKind::ProcessName => value.to_string(),
+        };
+        if value.is_empty() || value.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(AppRule { kind, value, action })
+    }
+}
+
+fn looks_like_domain(text: &str) -> bool {
+    let Some((_, tld)) = text.rsplit_once('.') else {
+        return false;
+    };
+    !tld.is_empty()
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+        && !matches!(tld, "exe" | "bin" | "sh" | "py" | "AppImage" | "appimage")
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// Contents of rules.json.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RulesConfig {
+    #[serde(default)]
+    pub default_mode: RoutingMode,
+    #[serde(default)]
+    pub rules: Vec<AppRule>,
+}
+
+/// Load `dir/rules.json`; a missing file means defaults.
+pub fn load_rules(dir: &Path) -> Result<RulesConfig> {
+    let path = dir.join(RULES_FILENAME);
+    if !path.exists() {
+        return Ok(RulesConfig::default());
+    }
+    let data = fs::read(&path).with_context(|| format!("failed to read {:?}", path))?;
+    serde_json::from_slice(&data).with_context(|| format!("failed to parse {:?}", path))
+}
+
+/// Atomically write `dir/rules.json`.
+pub fn save_rules(dir: &Path, rules: &RulesConfig) -> Result<()> {
+    let data = serde_json::to_vec_pretty(rules)?;
+    atomic_write(&dir.join(RULES_FILENAME), &data)
+}
+
+mod lowercase_action {
+    use super::RuleAction;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(action: &RuleAction, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(action.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<RuleAction, D::Error> {
+        let raw = String::deserialize(d)?;
+        match raw.to_ascii_lowercase().as_str() {
+            "proxy" => Ok(RuleAction::Proxy),
+            "direct" => Ok(RuleAction::Direct),
+            "block" => Ok(RuleAction::Block),
+            _ => Err(serde::de::Error::custom(format!("unknown rule action {raw:?}"))),
+        }
+    }
 }
 
 fn default_mixed_port() -> u16 {

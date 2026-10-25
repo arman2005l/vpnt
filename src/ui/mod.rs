@@ -124,7 +124,7 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
     }
 
     match state.input_mode {
-        InputMode::Adding(_) | InputMode::Renaming(_) => {
+        InputMode::Adding(_) | InputMode::Renaming(_) | InputMode::AddingRule(_) => {
             return match key.code {
                 KeyCode::Enter => Some(Action::InputSubmit),
                 KeyCode::Esc => Some(Action::InputCancel),
@@ -133,7 +133,7 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
                 _ => None,
             };
         }
-        InputMode::ConfirmDelete => {
+        InputMode::ConfirmDelete | InputMode::ConfirmApplyRules => {
             return match key.code {
                 KeyCode::Esc => Some(Action::InputCancel),
                 KeyCode::Char(c) => Some(Action::InputChar(c)),
@@ -141,6 +141,16 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
             };
         }
         InputMode::Normal => {}
+    }
+
+    if state.active_tab == Tab::Apps {
+        match key.code {
+            KeyCode::Char('a') => return Some(Action::AddRule),
+            KeyCode::Char('d') => return Some(Action::DeleteRule),
+            KeyCode::Char('m') => return Some(Action::ToggleDefaultMode),
+            KeyCode::Char(' ') => return Some(Action::Confirm),
+            _ => {}
+        }
     }
 
     if state.active_tab == Tab::Proxies {

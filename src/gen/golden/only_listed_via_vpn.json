@@ -1,0 +1,139 @@
+{
+  "dns": {
+    "final": "dns-remote",
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-private"
+        ],
+        "server": "dns-local"
+      }
+    ],
+    "servers": [
+      {
+        "detour": "proxy",
+        "server": "1.1.1.1",
+        "tag": "dns-remote",
+        "type": "https"
+      },
+      {
+        "server": "223.5.5.5",
+        "tag": "dns-local",
+        "type": "https"
+      }
+    ]
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "SECRET"
+    }
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "listen_port": 10808,
+      "tag": "socks-in",
+      "type": "socks"
+    },
+    {
+      "listen": "127.0.0.1",
+      "listen_port": 10809,
+      "tag": "http-in",
+      "type": "http"
+    }
+  ],
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "password": "pw",
+      "server": "1.2.3.4",
+      "server_port": 443,
+      "tag": "proxy",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      },
+      "type": "hysteria2"
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local",
+    "final": "direct",
+    "find_process": true,
+    "rule_set": [
+      {
+        "format": "binary",
+        "tag": "geosite-private",
+        "type": "remote",
+        "update_interval": "7d",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-private.srs"
+      },
+      {
+        "format": "binary",
+        "tag": "geosite-category-ads-all",
+        "type": "remote",
+        "update_interval": "7d",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs"
+      },
+      {
+        "format": "binary",
+        "tag": "geoip-private",
+        "type": "remote",
+        "update_interval": "7d",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-private.srs"
+      }
+    ],
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "action": "hijack-dns",
+        "protocol": "dns"
+      },
+      {
+        "action": "reject",
+        "rule_set": [
+          "geosite-category-ads-all"
+        ]
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "outbound": "proxy",
+        "process_name": [
+          "telegram-desktop"
+        ]
+      },
+      {
+        "outbound": "proxy",
+        "process_name": [
+          "firefox"
+        ]
+      },
+      {
+        "domain_suffix": [
+          "youtube.com"
+        ],
+        "outbound": "proxy"
+      },
+      {
+        "action": "reject",
+        "process_name": [
+          "torrent"
+        ]
+      }
+    ]
+  }
+}

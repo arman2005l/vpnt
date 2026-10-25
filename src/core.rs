@@ -6,7 +6,7 @@
 //!
 //! M1 scope: local spawn only (no systemd integration).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +106,26 @@ impl Supervisor {
         self.inner.lock().await.status.clone()
     }
 
+    /// Run `sing-box check -c <path>`; the error carries sing-box's message.
+    pub async fn check_config(&self, path: &Path) -> Result<()> {
+        let bin = self.inner.lock().await.bin.clone();
+        let out = Command::new(&bin)
+            .arg("check")
+            .arg("--disable-color")
+            .arg("-c")
+            .arg(path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("run {} check", bin.display()))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let mut text = String::from_utf8_lossy(&out.stderr).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stdout));
+        bail!("{}", check_error_message(&text))
+    }
+
     /// Poll the child: if it has exited, update status and return `false`.
     /// Call this periodically from the UI event loop.
     pub async fn poll(&self) -> bool {
@@ -136,6 +156,23 @@ impl Supervisor {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Pick the most useful line of `sing-box check` output.
+fn check_error_message(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with("FATAL") || l.starts_with("ERROR"))
+        .or(lines.last())
+        .copied()
+        .unwrap_or("sing-box check failed");
+    match line.split_once("] ") {
+        Some((prefix, rest)) if prefix.starts_with("FATAL[") || prefix.starts_with("ERROR[") => {
+            rest.to_string()
+        }
+        _ => line.to_string(),
+    }
+}
 
 fn spawn_child(g: &mut Inner) -> Result<()> {
     let mut cmd = Command::new(&g.bin);
@@ -246,6 +283,19 @@ mod tests {
     async fn poll_when_stopped_returns_false() {
         let sv = make_supervisor();
         assert!(!sv.poll().await);
+    }
+
+    #[tokio::test]
+    async fn check_with_missing_binary_errors() {
+        let sv = make_supervisor();
+        assert!(sv.check_config(Path::new("/nonexistent/config.json")).await.is_err());
+    }
+
+    #[test]
+    fn check_error_message_strips_prefix() {
+        let out = "WARN[0000] something deprecated\nFATAL[0000] decode config: bad thing\n";
+        assert_eq!(check_error_message(out), "decode config: bad thing");
+        assert_eq!(check_error_message(""), "sing-box check failed");
     }
 
     #[tokio::test]

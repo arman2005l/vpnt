@@ -8,15 +8,23 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::config::{ProxyConfig, Store};
+use crate::config::{self, AppRule, AppRuleKind, ProxyConfig, RulesConfig, Store};
 use crate::core::{Status, Supervisor};
 use crate::gen;
 use crate::net;
 use crate::parse;
-use crate::ui::dashboard::{DashUpdate, DashboardState, Monitor, MonitorTargets, Probe};
+use crate::ui::dashboard::{
+    DashUpdate, DashUpdateKind, DashboardState, Monitor, MonitorTargets, Probe,
+};
 
 /// How long a status-line notice stays visible.
 const NOTICE_TTL: Duration = Duration::from_secs(6);
+
+/// Maximum number of entries in the "recently seen apps" list.
+const SEEN_APPS_MAX: usize = 50;
+
+/// Candidate config written and checked before it replaces config.json.
+const PENDING_CONFIG_FILENAME: &str = "config.pending.json";
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
@@ -51,6 +59,12 @@ pub enum Action {
     InputCancel,
     /// Bracketed paste payload.
     Paste(String),
+    /// Apps tab: open the inline "add rule" input.
+    AddRule,
+    /// Apps tab: delete the selected rule.
+    DeleteRule,
+    /// Apps tab: toggle rules.json default_mode.
+    ToggleDefaultMode,
 }
 
 /// Modal input state for the Configs tab.
@@ -60,6 +74,10 @@ pub enum InputMode {
     Adding(String),
     Renaming(String),
     ConfirmDelete,
+    /// Apps tab: typing a new rule.
+    AddingRule(String),
+    /// Apps tab: rules changed while connected; apply and restart?
+    ConfirmApplyRules,
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -68,17 +86,20 @@ pub enum InputMode {
 pub enum Tab {
     Status,
     Proxies,
+    Apps,
     Settings,
     Logs,
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] = &[Tab::Status, Tab::Proxies, Tab::Settings, Tab::Logs];
+    pub const ALL: &'static [Tab] =
+        &[Tab::Status, Tab::Proxies, Tab::Apps, Tab::Settings, Tab::Logs];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Status   => "Dashboard",
             Tab::Proxies  => "Configs",
+            Tab::Apps     => "Apps",
             Tab::Settings => "Settings",
             Tab::Logs     => "Logs",
         }
@@ -132,6 +153,14 @@ pub struct AppState {
     monitor: Option<Monitor>,
     dash_tx: mpsc::UnboundedSender<DashUpdate>,
     dash_rx: mpsc::UnboundedReceiver<DashUpdate>,
+    /// Contents of rules.json.
+    pub rules: RulesConfig,
+    /// Apps tab cursor: `0..rules.len()` are rules, the rest are seen apps.
+    pub apps_cursor: usize,
+    /// Process names seen in Clash `/connections`, most recent first.
+    pub seen_apps: Vec<String>,
+    /// Rules changed while connected but not applied to the running core.
+    pub rules_pending: bool,
 }
 
 impl AppState {
@@ -155,6 +184,12 @@ impl AppState {
         }
         let (ping_tx, ping_rx) = mpsc::unbounded_channel();
         let (dash_tx, dash_rx) = mpsc::unbounded_channel();
+        let mut notice = None;
+        let rules = config::load_rules(&data_dir).unwrap_or_else(|e| {
+            tracing::warn!("could not load rules: {e:#}; using defaults");
+            notice = Some(format!("rules.json ignored: {e:#}"));
+            RulesConfig::default()
+        });
 
         Self {
             supervisor,
@@ -165,8 +200,8 @@ impl AppState {
             proxy_cursor: 0,
             show_help: false,
             log_lines: Vec::new(),
-            notice: None,
-            notice_at: None,
+            notice_at: notice.as_ref().map(|_| Instant::now()),
+            notice,
             input_mode: InputMode::Normal,
             pinging: false,
             ping_tx,
@@ -175,6 +210,10 @@ impl AppState {
             monitor: None,
             dash_tx,
             dash_rx,
+            rules,
+            apps_cursor: 0,
+            seen_apps: Vec::new(),
+            rules_pending: false,
         }
     }
 
@@ -216,16 +255,42 @@ impl AppState {
                 }
             }
             Action::PingAll => self.start_ping_all(),
+            Action::AddRule => {
+                if self.active_tab == Tab::Apps {
+                    self.input_mode = InputMode::AddingRule(String::new());
+                }
+            }
+            Action::DeleteRule => self.delete_rule().await,
+            Action::ToggleDefaultMode => self.toggle_default_mode().await,
+            Action::InputChar(c) if self.input_mode == InputMode::ConfirmApplyRules => {
+                self.input_mode = InputMode::Normal;
+                if c == 'y' || c == 'Y' {
+                    self.apply_rules().await;
+                } else {
+                    self.set_notice("Rules saved; not applied to the running core yet.");
+                }
+            }
             Action::InputChar(c) => self.input_char(c),
             Action::InputBackspace => {
-                if let InputMode::Adding(buf) | InputMode::Renaming(buf) = &mut self.input_mode {
+                if let InputMode::Adding(buf) | InputMode::Renaming(buf) | InputMode::AddingRule(buf) =
+                    &mut self.input_mode
+                {
                     buf.pop();
                 }
             }
-            Action::InputSubmit => self.input_submit(),
+            Action::InputSubmit => {
+                if let InputMode::AddingRule(text) = self.input_mode.clone() {
+                    self.input_mode = InputMode::Normal;
+                    self.add_rule_from_input(&text).await;
+                } else {
+                    self.input_submit();
+                }
+            }
             Action::InputCancel => self.input_mode = InputMode::Normal,
             Action::Paste(text) => {
-                if let InputMode::Adding(buf) | InputMode::Renaming(buf) = &mut self.input_mode {
+                if let InputMode::Adding(buf) | InputMode::Renaming(buf) | InputMode::AddingRule(buf) =
+                    &mut self.input_mode
+                {
                     buf.push_str(text.trim());
                 }
             }
@@ -244,6 +309,10 @@ impl AppState {
             self.stop_monitor();
         }
         while let Ok(update) = self.dash_rx.try_recv() {
+            if let DashUpdateKind::Connections(summary) = &update.kind {
+                let names: Vec<String> = summary.per_process.iter().map(|(n, _)| n.clone()).collect();
+                self.note_seen_apps(&names);
+            }
             self.dashboard.apply(update);
         }
         while let Ok(results) = self.ping_rx.try_recv() {
@@ -274,7 +343,9 @@ impl AppState {
 
     fn input_char(&mut self, c: char) {
         match &mut self.input_mode {
-            InputMode::Adding(buf) | InputMode::Renaming(buf) => buf.push(c),
+            InputMode::Adding(buf) | InputMode::Renaming(buf) | InputMode::AddingRule(buf) => {
+                buf.push(c)
+            }
             InputMode::ConfirmDelete => match c {
                 'y' | 'Y' => self.delete_selected(),
                 _ => {
@@ -282,7 +353,7 @@ impl AppState {
                     self.set_notice("Delete cancelled.");
                 }
             },
-            InputMode::Normal => {}
+            InputMode::ConfirmApplyRules | InputMode::Normal => {}
         }
     }
 
@@ -292,7 +363,8 @@ impl AppState {
             InputMode::Adding(text) => self.add_config(&text),
             InputMode::Renaming(text) => self.rename_selected(&text),
             InputMode::ConfirmDelete => self.input_mode = InputMode::ConfirmDelete,
-            InputMode::Normal => {}
+            InputMode::ConfirmApplyRules => self.input_mode = InputMode::ConfirmApplyRules,
+            InputMode::AddingRule(_) | InputMode::Normal => {}
         }
     }
 
@@ -411,7 +483,10 @@ impl AppState {
                 self.notice = Some(format!("Config error: {e}"));
                 return;
             }
-            Ok(path) => tracing::info!("wrote config to {}", path.display()),
+            Ok(path) => {
+                tracing::info!("wrote config to {}", path.display());
+                self.rules_pending = false;
+            }
         }
 
         if let Err(e) = self.supervisor.start().await {
@@ -485,6 +560,14 @@ impl AppState {
     // ── Cursor / confirm ──────────────────────────────────────────────────
 
     fn move_cursor(&mut self, delta: i32) {
+        if self.active_tab == Tab::Apps {
+            let len = self.rules.rules.len() + self.seen_apps.len();
+            if len > 0 {
+                let c = self.apps_cursor as i32 + delta;
+                self.apps_cursor = c.rem_euclid(len as i32) as usize;
+            }
+            return;
+        }
         let len = self.store.proxies.len();
         if len == 0 { return; }
         let c = self.proxy_cursor as i32 + delta;
@@ -492,6 +575,10 @@ impl AppState {
     }
 
     async fn confirm(&mut self) {
+        if self.active_tab == Tab::Apps {
+            self.activate_apps_item().await;
+            return;
+        }
         // On the Configs tab, Enter activates the selected config.
         if self.active_tab == Tab::Proxies {
             if let Some(proxy) = self.store.proxies.get(self.proxy_cursor) {
@@ -501,6 +588,138 @@ impl AppState {
                     self.set_notice(format!("Active config → {name}"));
                 }
             }
+        }
+    }
+
+    // ── Apps tab ──────────────────────────────────────────────────────────
+
+    /// Merge process names from one `/connections` poll into `seen_apps`.
+    fn note_seen_apps(&mut self, names: &[String]) {
+        for name in names.iter().rev() {
+            if name == "unknown" || name.is_empty() {
+                continue;
+            }
+            if let Some(pos) = self.seen_apps.iter().position(|n| n == name) {
+                self.seen_apps.remove(pos);
+            }
+            self.seen_apps.insert(0, name.clone());
+        }
+        self.seen_apps.truncate(SEEN_APPS_MAX);
+    }
+
+    /// Action of the process_name rule for `app`, if one exists.
+    pub fn app_rule_action(&self, app: &str) -> Option<config::RuleAction> {
+        self.rules
+            .rules
+            .iter()
+            .find(|r| r.kind == AppRuleKind::ProcessName && r.value == app)
+            .map(|r| r.action.clone())
+    }
+
+    /// Enter/Space: cycle a rule's action, or create a rule for a seen app.
+    async fn activate_apps_item(&mut self) {
+        let n_rules = self.rules.rules.len();
+        if self.apps_cursor < n_rules {
+            let rule = &mut self.rules.rules[self.apps_cursor];
+            rule.action = rule.action.cycle();
+            let msg = format!("{} {} → {}", rule.kind.as_str(), rule.value, rule.action.as_str());
+            self.rules_changed(msg).await;
+        } else if let Some(app) = self.seen_apps.get(self.apps_cursor - n_rules).cloned() {
+            if self.app_rule_action(&app).is_some() {
+                self.set_notice(format!("{app} already has a rule."));
+                return;
+            }
+            let action = self.rules.default_mode.new_rule_action();
+            self.add_rule(AppRule { kind: AppRuleKind::ProcessName, value: app, action }).await;
+        }
+    }
+
+    async fn add_rule_from_input(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            self.set_notice("Nothing to add.");
+            return;
+        }
+        let action = self.rules.default_mode.new_rule_action();
+        match AppRule::from_input(text, action) {
+            Some(rule) => self.add_rule(rule).await,
+            None => self.set_notice("Invalid rule: enter an app name or a domain, no spaces."),
+        }
+    }
+
+    async fn add_rule(&mut self, rule: AppRule) {
+        if self.rules.rules.iter().any(|r| r.kind == rule.kind && r.value == rule.value) {
+            self.set_notice(format!("A rule for {} already exists.", rule.value));
+            return;
+        }
+        let msg = format!("Added {} {} → {}", rule.kind.as_str(), rule.value, rule.action.as_str());
+        self.rules.rules.push(rule);
+        self.apps_cursor = self.rules.rules.len() - 1;
+        self.rules_changed(msg).await;
+    }
+
+    async fn delete_rule(&mut self) {
+        if self.active_tab != Tab::Apps || self.apps_cursor >= self.rules.rules.len() {
+            return;
+        }
+        let removed = self.rules.rules.remove(self.apps_cursor);
+        let len = self.rules.rules.len() + self.seen_apps.len();
+        if self.apps_cursor > 0 && self.apps_cursor >= len {
+            self.apps_cursor = len - 1;
+        }
+        self.rules_changed(format!("Deleted rule {}", removed.value)).await;
+    }
+
+    async fn toggle_default_mode(&mut self) {
+        if self.active_tab != Tab::Apps {
+            return;
+        }
+        self.rules.default_mode = self.rules.default_mode.toggle();
+        let msg = format!("Default mode → {}", self.rules.default_mode.as_str());
+        self.rules_changed(msg).await;
+    }
+
+    /// Save rules.json; when connected, ask whether to apply now.
+    async fn rules_changed(&mut self, msg: String) {
+        if let Err(e) = config::save_rules(&self.data_dir, &self.rules) {
+            self.set_notice(format!("Save failed: {e:#}"));
+            return;
+        }
+        if matches!(self.supervisor.status().await, Status::Running(_)) {
+            self.rules_pending = true;
+            self.input_mode = InputMode::ConfirmApplyRules;
+        }
+        self.set_notice(msg);
+    }
+
+    /// Write the new config to a pending file and `sing-box check` it.  Only
+    /// if that passes does it replace config.json and restart the core;
+    /// otherwise the running core keeps its old config.
+    async fn apply_rules(&mut self) {
+        let Some(proxy) = self.active_proxy().cloned() else {
+            self.set_notice("No proxy selected.");
+            return;
+        };
+        let pending = self.data_dir.join(PENDING_CONFIG_FILENAME);
+        let live = self.data_dir.join(gen::CONFIG_FILENAME);
+        if let Err(e) = gen::write_config_to(&pending, &proxy, &self.store.settings, &self.rules) {
+            self.set_notice(format!("Config error: {e:#}"));
+            return;
+        }
+        if let Err(e) = self.supervisor.check_config(&pending).await {
+            let _ = std::fs::remove_file(&pending);
+            tracing::warn!("sing-box check failed; keeping old config: {e:#}");
+            self.set_notice(format!("Check failed, old config kept: {e:#}"));
+            return;
+        }
+        if let Err(e) = std::fs::rename(&pending, &live) {
+            let _ = std::fs::remove_file(&pending);
+            self.set_notice(format!("Could not replace config: {e}"));
+            return;
+        }
+        self.rules_pending = false;
+        self.restart_proxy().await;
+        if matches!(self.proc_status, Status::Running(_)) {
+            self.set_notice("Rules applied; sing-box restarted.");
         }
     }
 
@@ -581,6 +800,52 @@ mod tests {
         assert!(proxy_from_link("garbage").is_err());
         assert!(proxy_from_link("{\"server\":\"x\"}").is_err());
     }
+
+    fn make_app(dir: &std::path::Path) -> AppState {
+        let sv = Supervisor::new(PathBuf::from("/nonexistent/sing-box"), dir.join("config.json"));
+        let mut app = AppState::new(sv, dir.to_path_buf());
+        app.active_tab = Tab::Apps;
+        app
+    }
+
+    #[tokio::test]
+    async fn seen_apps_most_recent_first_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app(dir.path());
+        app.note_seen_apps(&["firefox".into(), "unknown".into(), "curl".into()]);
+        app.note_seen_apps(&["telegram".into(), "curl".into()]);
+        assert_eq!(app.seen_apps, vec!["telegram", "curl", "firefox"]);
+    }
+
+    #[tokio::test]
+    async fn apps_tab_add_cycle_delete_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app(dir.path());
+        app.handle(Action::AddRule).await;
+        for c in "example.com".chars() {
+            app.handle(Action::InputChar(c)).await;
+        }
+        app.handle(Action::InputSubmit).await;
+        assert_eq!(app.rules.rules.len(), 1);
+        assert_eq!(app.rules.rules[0].kind, AppRuleKind::DomainSuffix);
+        assert_eq!(app.rules.rules[0].action, config::RuleAction::Direct);
+
+        app.handle(Action::Confirm).await;
+        assert_eq!(app.rules.rules[0].action, config::RuleAction::Block);
+        app.handle(Action::ToggleDefaultMode).await;
+        assert_eq!(config::load_rules(dir.path()).unwrap(), app.rules);
+
+        app.note_seen_apps(&["firefox".into()]);
+        app.handle(Action::SelectNext).await;
+        app.handle(Action::Confirm).await;
+        assert_eq!(app.app_rule_action("firefox"), Some(config::RuleAction::Proxy));
+
+        app.apps_cursor = 0;
+        app.handle(Action::DeleteRule).await;
+        assert_eq!(app.rules.rules.len(), 1);
+        assert_eq!(config::load_rules(dir.path()).unwrap().rules.len(), 1);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
 }
 
 // ── draw ──────────────────────────────────────────────────────────────────────
@@ -611,6 +876,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) -> Result<()> {
     match state.active_tab {
         Tab::Status   => widgets::status_panel(frame, chunks[1], state),
         Tab::Proxies  => widgets::proxy_list(frame, chunks[1], state),
+        Tab::Apps     => widgets::apps_panel(frame, chunks[1], state),
         Tab::Settings => widgets::settings_panel(frame, chunks[1], state),
         Tab::Logs     => widgets::log_panel(frame, chunks[1], state),
     }

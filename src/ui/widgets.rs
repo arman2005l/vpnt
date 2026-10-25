@@ -262,7 +262,10 @@ pub fn proxy_list(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let prompt_height = if state.input_mode == InputMode::Normal { 1 } else { 3 };
+    let prompt_height = match state.input_mode {
+        InputMode::Adding(_) | InputMode::Renaming(_) | InputMode::ConfirmDelete => 3,
+        _ => 1,
+    };
     let [list_area, prompt_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(prompt_height)])
@@ -351,6 +354,7 @@ fn config_prompt(frame: &mut Frame, area: Rect, state: &AppState) {
             format!("{buf}▏"),
         ),
         InputMode::Renaming(buf) => (" Rename (Enter save, Esc cancel) ", format!("{buf}▏")),
+        InputMode::AddingRule(_) | InputMode::ConfirmApplyRules => return,
         InputMode::ConfirmDelete => {
             let name = state
                 .store
@@ -400,6 +404,178 @@ fn proxy_protocol_label(p: &crate::config::ProxyConfig) -> &'static str {
 }
 
 // ── Settings panel ────────────────────────────────────────────────────────────
+
+// ── Apps panel ────────────────────────────────────────────────────────────────
+
+fn action_color(action: &crate::config::RuleAction) -> Color {
+    match action {
+        crate::config::RuleAction::Proxy => palette::ACCENT,
+        crate::config::RuleAction::Direct => palette::SUCCESS,
+        crate::config::RuleAction::Block => palette::DANGER,
+    }
+}
+
+pub fn apps_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = accent_block("Apps");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let prompt_height = match state.input_mode {
+        InputMode::AddingRule(_) | InputMode::ConfirmApplyRules => 3,
+        _ => 1,
+    };
+    let [mode_area, body_area, prompt_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(prompt_height),
+        ])
+        .areas(inner);
+
+    let mut mode_spans = vec![
+        Span::styled("Default: ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            state.rules.default_mode.as_str(),
+            Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if state.rules_pending {
+        mode_spans.push(Span::styled(
+            "   (changes not applied to running core)",
+            Style::default().fg(palette::WARNING),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(mode_spans)), mode_area);
+
+    let [rules_area, seen_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .areas(body_area);
+
+    let n_rules = state.rules.rules.len();
+    let highlight = Style::default()
+        .fg(palette::ACCENT)
+        .bg(palette::RAISED)
+        .add_modifier(Modifier::BOLD);
+
+    // Rules table.
+    let rules_block = Block::default()
+        .title(Span::styled(" Rules (in order) ", Style::default().fg(palette::MUTED)))
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(palette::BORDER));
+    if n_rules == 0 {
+        frame.render_widget(
+            Paragraph::new("No rules.  Press a to add an app or domain.")
+                .style(Style::default().fg(palette::MUTED))
+                .block(rules_block),
+            rules_area,
+        );
+    } else {
+        let header = Row::new(vec!["Kind", "Value", "Action"])
+            .style(Style::default().fg(palette::MUTED).add_modifier(Modifier::BOLD));
+        let rows: Vec<Row> = state
+            .rules
+            .rules
+            .iter()
+            .map(|r| {
+                Row::new(vec![
+                    Cell::from(r.kind.as_str()).style(Style::default().fg(palette::MUTED)),
+                    Cell::from(r.value.clone()).style(Style::default().fg(palette::BODY)),
+                    Cell::from(r.action.as_str()).style(Style::default().fg(action_color(&r.action))),
+                ])
+            })
+            .collect();
+        let mut table_state = TableState::default();
+        if state.apps_cursor < n_rules {
+            table_state.select(Some(state.apps_cursor));
+        }
+        let table = Table::new(
+            rows,
+            [Constraint::Length(14), Constraint::Min(10), Constraint::Length(7)],
+        )
+        .header(header)
+        .block(rules_block)
+        .highlight_style(highlight)
+        .column_spacing(1);
+        frame.render_stateful_widget(table, rules_area, &mut table_state);
+    }
+
+    // Recently seen apps.
+    let seen_block = Block::default()
+        .title(Span::styled(" Recently seen apps ", Style::default().fg(palette::MUTED)))
+        .padding(Padding::horizontal(1));
+    if state.seen_apps.is_empty() {
+        let hint = if matches!(state.proc_status, Status::Running(_)) {
+            "Waiting for connections…"
+        } else {
+            "Connect to see apps."
+        };
+        frame.render_widget(
+            Paragraph::new(hint)
+                .style(Style::default().fg(palette::MUTED))
+                .block(seen_block),
+            seen_area,
+        );
+    } else {
+        let items: Vec<ListItem> = state
+            .seen_apps
+            .iter()
+            .map(|app| {
+                let tag = match state.app_rule_action(app) {
+                    Some(a) => Span::styled(format!("  [{}]", a.as_str()), Style::default().fg(action_color(&a))),
+                    None => Span::raw(""),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(app.clone(), Style::default().fg(palette::BODY)),
+                    tag,
+                ]))
+            })
+            .collect();
+        let mut list_state = ListState::default();
+        if state.apps_cursor >= n_rules {
+            list_state.select(Some(state.apps_cursor - n_rules));
+        }
+        let list = List::new(items).block(seen_block).highlight_style(highlight);
+        frame.render_stateful_widget(list, seen_area, &mut list_state);
+    }
+
+    apps_prompt(frame, prompt_area, state);
+}
+
+fn apps_prompt(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (title, body) = match &state.input_mode {
+        InputMode::AddingRule(buf) => (
+            " Add rule: app name or domain (app:/domain: to force; Enter save, Esc cancel) ",
+            format!("{buf}▏"),
+        ),
+        InputMode::ConfirmApplyRules => (
+            " Apply rules ",
+            "Apply now? Regenerates config, runs sing-box check, restarts the core. y = yes, any other key = later"
+                .to_string(),
+        ),
+        _ => {
+            frame.render_widget(
+                Paragraph::new("a add  Enter/Space cycle action / add seen app  d delete  m default mode")
+                    .style(Style::default().fg(palette::MUTED)),
+                area,
+            );
+            return;
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(Style::default().fg(palette::BODY))
+            .block(
+                Block::default()
+                    .title(Span::styled(title, Style::default().fg(palette::WARNING)))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(palette::ACCENT_DIM)),
+            ),
+        area,
+    );
+}
 
 pub fn settings_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = accent_block("Settings");
@@ -569,6 +745,7 @@ pub fn help_overlay(frame: &mut Frame, area: Rect) {
         ("j / ↓  k / ↑",        "Move cursor"),
         ("Enter",                "Set selected config active"),
         ("a / e / d / t",        "Configs: add/rename/delete/ping"),
+        ("a / Enter / d / m",    "Apps: add/cycle/delete/mode"),
         ("s",                    "Start / stop proxy"),
         ("r",                    "Dashboard: refresh IP/latency"),
         ("R / r (other tabs)",   "Restart proxy"),
