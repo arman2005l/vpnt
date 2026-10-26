@@ -6,6 +6,7 @@
 //!
 //! M1 scope: local spawn only (no systemd integration).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,6 +18,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+/// Maximum number of sing-box output lines kept in memory.
+pub const LOG_CAPACITY: usize = 1000;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -31,12 +35,67 @@ pub enum Status {
     Failed(String),
 }
 
+/// A copy of the log ring buffer.
+///
+/// `first_index` counts every line ever dropped from the front, so a viewer
+/// can keep its scroll position stable while old lines fall off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogSnapshot {
+    pub first_index: u64,
+    pub lines: Vec<String>,
+}
+
+#[derive(Default)]
+struct LogRing {
+    lines: VecDeque<String>,
+    dropped: u64,
+}
+
+type SharedLog = Arc<std::sync::Mutex<LogRing>>;
+
+fn push_log(log: &SharedLog, line: &str) {
+    let clean = sanitize_log_line(line);
+    if let Ok(mut ring) = log.lock() {
+        ring.lines.push_back(clean);
+        while ring.lines.len() > LOG_CAPACITY {
+            ring.lines.pop_front();
+            ring.dropped += 1;
+        }
+    }
+}
+
+/// Strip ANSI escape sequences and control characters so the TUI stays intact.
+fn sanitize_log_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch == '\t' {
+            out.push_str("    ");
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Owns and supervises a sing-box child process.
 ///
 /// Clone-cheap: the inner state lives behind an `Arc<Mutex<...>>`.
 #[derive(Clone)]
 pub struct Supervisor {
     inner: Arc<Mutex<Inner>>,
+    log: SharedLog,
 }
 
 struct Inner {
@@ -61,6 +120,18 @@ impl Supervisor {
                 child: None,
                 status: Status::Stopped,
             })),
+            log: SharedLog::default(),
+        }
+    }
+
+    /// Copy of the last `LOG_CAPACITY` lines of sing-box output.
+    pub fn log_snapshot(&self) -> LogSnapshot {
+        match self.log.lock() {
+            Ok(ring) => LogSnapshot {
+                first_index: ring.dropped,
+                lines: ring.lines.iter().cloned().collect(),
+            },
+            Err(_) => LogSnapshot::default(),
         }
     }
 
@@ -70,7 +141,10 @@ impl Supervisor {
         if matches!(g.status, Status::Running(_)) {
             bail!("sing-box is already running");
         }
-        spawn_child(&mut g)?;
+        if let Err(e) = spawn_child(&mut g, &self.log) {
+            push_log(&self.log, &format!("[vpnt] start failed: {e:#}"));
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -82,6 +156,7 @@ impl Supervisor {
             Some(mut child) => {
                 terminate_child(&mut child).await;
                 g.status = Status::Stopped;
+                push_log(&self.log, "[vpnt] sing-box stopped");
             }
         }
         Ok(())
@@ -93,6 +168,7 @@ impl Supervisor {
             let mut g = self.inner.lock().await;
             if let Some(mut child) = g.child.take() {
                 terminate_child(&mut child).await;
+                push_log(&self.log, "[vpnt] sing-box stopped for restart");
             }
             g.status = Status::Stopped;
         }
@@ -141,6 +217,7 @@ impl Supervisor {
                     format!("exited: {exit}")
                 };
                 warn!("sing-box {}", msg);
+                push_log(&self.log, &format!("[vpnt] sing-box {msg}"));
                 g.child = None;
                 g.status = Status::Failed(msg);
                 false
@@ -174,7 +251,7 @@ fn check_error_message(output: &str) -> String {
     }
 }
 
-fn spawn_child(g: &mut Inner) -> Result<()> {
+fn spawn_child(g: &mut Inner, log: &SharedLog) -> Result<()> {
     let mut cmd = Command::new(&g.bin);
     cmd.arg("run")
         .arg("-c")
@@ -202,14 +279,16 @@ fn spawn_child(g: &mut Inner) -> Result<()> {
 
     let pid = child.id().unwrap_or(0);
     info!("sing-box started (pid {pid})");
+    push_log(log, &format!("[vpnt] sing-box started (pid {pid})"));
 
-    // Pipe stderr to tracing in a background task.
+    // Pipe stderr into the ring buffer (and tracing) in a background task.
     if let Some(stderr) = child.stderr.take() {
+        let log = log.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                // sing-box lines are JSON; log them verbatim at debug level.
                 tracing::debug!(target: "singbox", "{line}");
+                push_log(&log, &line);
             }
         });
     }
@@ -221,17 +300,12 @@ fn spawn_child(g: &mut Inner) -> Result<()> {
 
 /// Best-effort graceful termination.
 async fn terminate_child(child: &mut Child) {
-    // Ask nicely first.
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // SAFETY: kill(2) with SIGTERM is always safe to call.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        }
-    }
-    #[cfg(windows)]
-    {
+    // Ask nicely first; platforms without a graceful signal force-kill.
+    let asked = child.id().map(crate::platform::request_terminate).unwrap_or(false);
+    if !asked {
         let _ = child.kill().await;
+        let _ = child.wait().await;
+        return;
     }
 
     // Wait up to 3 seconds, then force-kill.
@@ -296,6 +370,23 @@ mod tests {
         let out = "WARN[0000] something deprecated\nFATAL[0000] decode config: bad thing\n";
         assert_eq!(check_error_message(out), "decode config: bad thing");
         assert_eq!(check_error_message(""), "sing-box check failed");
+    }
+
+    #[test]
+    fn log_ring_caps_and_counts_dropped() {
+        let sv = make_supervisor();
+        for i in 0..(LOG_CAPACITY + 5) {
+            push_log(&sv.log, &format!("line {i}"));
+        }
+        let snap = sv.log_snapshot();
+        assert_eq!(snap.lines.len(), LOG_CAPACITY);
+        assert_eq!(snap.first_index, 5);
+        assert_eq!(snap.lines[0], "line 5");
+    }
+
+    #[test]
+    fn sanitize_strips_ansi() {
+        assert_eq!(sanitize_log_line("\u{1b}[36mINFO\u{1b}[0m a\tb"), "INFO a    b");
     }
 
     #[tokio::test]

@@ -124,7 +124,10 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
     }
 
     match state.input_mode {
-        InputMode::Adding(_) | InputMode::Renaming(_) | InputMode::AddingRule(_) => {
+        InputMode::Adding(_)
+        | InputMode::Renaming(_)
+        | InputMode::AddingRule(_)
+        | InputMode::Importing(_) => {
             return match key.code {
                 KeyCode::Enter => Some(Action::InputSubmit),
                 KeyCode::Esc => Some(Action::InputCancel),
@@ -143,6 +146,26 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
         InputMode::Normal => {}
     }
 
+    // While the help overlay is open only close keys do anything.
+    if state.show_help {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => Some(Action::ToggleHelp),
+            KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
+            _ => None,
+        };
+    }
+
+    if state.active_tab == Tab::Logs {
+        match key.code {
+            KeyCode::PageUp => return Some(Action::LogPageUp),
+            KeyCode::PageDown => return Some(Action::LogPageDown),
+            KeyCode::Home => return Some(Action::LogHome),
+            KeyCode::End => return Some(Action::LogEnd),
+            KeyCode::Char('f') => return Some(Action::LogFollow),
+            _ => {}
+        }
+    }
+
     if state.active_tab == Tab::Apps {
         match key.code {
             KeyCode::Char('a') => return Some(Action::AddRule),
@@ -159,6 +182,7 @@ fn map_key(key: event::KeyEvent, state: &AppState) -> Option<Action> {
             KeyCode::Char('e') => return Some(Action::RenameConfig),
             KeyCode::Char('d') => return Some(Action::DeleteConfig),
             KeyCode::Char('t') => return Some(Action::PingAll),
+            KeyCode::Char('i') => return Some(Action::ImportSubscription),
             _ => {}
         }
     }

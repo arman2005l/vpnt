@@ -45,14 +45,19 @@ pub async fn fetch_subscription(url: &str) -> Result<Vec<String>> {
         bail!("subscription URL is empty");
     }
 
-    debug!("fetching subscription: {url}");
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        bail!("subscription URL must start with http:// or https://");
+    }
+
+    // The URL usually embeds an access token, so it is not logged.
+    debug!("fetching subscription");
 
     let client = build_client()?;
     let response = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("GET {url} failed"))?;
+        .map_err(|e| anyhow::anyhow!("request failed: {}", e.without_url()))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -77,14 +82,19 @@ pub async fn fetch_subscription(url: &str) -> Result<Vec<String>> {
 /// Decode a raw subscription body into a list of URI strings.
 ///
 /// Attempts base64 decode first; falls through to plain text on any error.
-fn decode_subscription_body(raw: &str) -> Vec<String> {
+pub fn decode_subscription_body(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
 
-    // Try base64 (standard + URL-safe; ignore padding errors).
+    // Try base64 (standard + URL-safe, padded or not, possibly line-wrapped).
     use base64::Engine as _;
-    let decoded_attempt = base64::engine::general_purpose::STANDARD
-        .decode(trimmed)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed));
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    let unpadded = compact.trim_end_matches('=');
+    let decoded_attempt = STANDARD
+        .decode(&compact)
+        .or_else(|_| URL_SAFE.decode(&compact))
+        .or_else(|_| STANDARD_NO_PAD.decode(unpadded))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(unpadded));
 
     let text = match decoded_attempt {
         Ok(bytes) => match String::from_utf8(bytes) {
@@ -112,6 +122,9 @@ fn looks_like_uri_list(s: &str) -> bool {
             || l.starts_with("vmess://")
             || l.starts_with("trojan://")
             || l.starts_with("ss://")
+            || l.starts_with("hysteria2://")
+            || l.starts_with("hy2://")
+            || l.starts_with("tuic://")
     })
 }
 
@@ -305,6 +318,33 @@ mod tests {
         assert_eq!(local_http_proxy_url(&mixed).as_deref(), Some("http://127.0.0.1:2"));
         let none = serde_json::json!({ "inbounds": [{ "type": "tun" }] });
         assert_eq!(local_http_proxy_url(&none), None);
+    }
+
+    #[test]
+    fn subscription_plain_list() {
+        let body = "# comment\nhy2://pw@a.example:443#a\n\n  trojan://pw@b.example:443#b  \n";
+        assert_eq!(
+            decode_subscription_body(body),
+            vec!["hy2://pw@a.example:443#a".to_string(), "trojan://pw@b.example:443#b".to_string()]
+        );
+    }
+
+    #[test]
+    fn subscription_base64_variants() {
+        use base64::Engine as _;
+        let plain = "hy2://pw@a.example:443#a\ntuic://u:p@b.example:443#b";
+        let padded = base64::engine::general_purpose::STANDARD.encode(plain);
+        let unpadded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(plain);
+        let wrapped = format!("{}\n{}", &padded[..10], &padded[10..]);
+        for body in [padded, unpadded, wrapped] {
+            assert_eq!(decode_subscription_body(&body).len(), 2, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_rejects_non_http() {
+        assert!(fetch_subscription("ftp://x").await.is_err());
+        assert!(fetch_subscription("  ").await.is_err());
     }
 
     #[test]

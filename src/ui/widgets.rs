@@ -263,7 +263,10 @@ pub fn proxy_list(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(block, area);
 
     let prompt_height = match state.input_mode {
-        InputMode::Adding(_) | InputMode::Renaming(_) | InputMode::ConfirmDelete => 3,
+        InputMode::Adding(_)
+        | InputMode::Renaming(_)
+        | InputMode::Importing(_)
+        | InputMode::ConfirmDelete => 3,
         _ => 1,
     };
     let [list_area, prompt_area] = Layout::default()
@@ -339,10 +342,16 @@ pub fn proxy_list(frame: &mut Frame, area: Rect, state: &AppState) {
 fn config_prompt(frame: &mut Frame, area: Rect, state: &AppState) {
     let (title, body) = match &state.input_mode {
         InputMode::Normal => {
-            let hint = if state.pinging { "pinging…  " } else { "" };
+            let mut hint = String::new();
+            if state.pinging {
+                hint.push_str("pinging…  ");
+            }
+            if state.importing {
+                hint.push_str("importing…  ");
+            }
             frame.render_widget(
                 Paragraph::new(format!(
-                    "{hint}a add  e rename  d delete  t ping all  Enter set active"
+                    "{hint}a add  i import  e rename  d delete  t ping all  Enter set active"
                 ))
                 .style(Style::default().fg(palette::MUTED)),
                 area,
@@ -354,6 +363,10 @@ fn config_prompt(frame: &mut Frame, area: Rect, state: &AppState) {
             format!("{buf}▏"),
         ),
         InputMode::Renaming(buf) => (" Rename (Enter save, Esc cancel) ", format!("{buf}▏")),
+        InputMode::Importing(buf) => (
+            " Import subscription: paste URL (Enter fetch, Esc cancel) ",
+            format!("{buf}▏"),
+        ),
         InputMode::AddingRule(_) | InputMode::ConfirmApplyRules => return,
         InputMode::ConfirmDelete => {
             let name = state
@@ -632,17 +645,34 @@ pub fn settings_panel(frame: &mut Frame, area: Rect, state: &AppState) {
 // ── Log panel ─────────────────────────────────────────────────────────────────
 
 pub fn log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = accent_block("Logs");
+    let total = state.log_lines.len();
+    let title = if state.log_follow {
+        format!("Logs ({total}, following)")
+    } else {
+        format!("Logs ({total}, paused — End or f to follow)")
+    };
+    let block = accent_block(&title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let height = inner.height as usize;
+    let height = (inner.height as usize).max(1);
+    state.log_view_height.set(height);
+    let start = state.log_start(height);
+
+    if total == 0 {
+        frame.render_widget(
+            Paragraph::new("No sing-box output yet. Connect to see logs.")
+                .style(Style::default().fg(palette::MUTED).bg(palette::SURFACE)),
+            inner,
+        );
+        return;
+    }
+
     let lines: Vec<Line> = state
         .log_lines
         .iter()
-        .rev()
+        .skip(start)
         .take(height)
-        .rev()
         .map(|l| {
             // Colour lines that start with known level prefixes.
             let style = if l.contains("ERROR") || l.contains("error") {
@@ -656,12 +686,7 @@ pub fn log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    let total = state.log_lines.len();
-    let offset = total.saturating_sub(height);
-
-    let para = Paragraph::new(Text::from(lines))
-        .style(Style::default().bg(palette::SURFACE))
-        .wrap(Wrap { trim: false });
+    let para = Paragraph::new(Text::from(lines)).style(Style::default().bg(palette::SURFACE));
 
     // Scrollbar only when content overflows.
     if total > height {
@@ -673,7 +698,7 @@ pub fn log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
 
         frame.render_widget(para, text_area);
 
-        let mut sb_state = ScrollbarState::new(total).position(offset);
+        let mut sb_state = ScrollbarState::new(total.saturating_sub(height) + 1).position(start);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(Style::default().fg(palette::BORDER)),
@@ -718,8 +743,36 @@ pub fn status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 // ── Help overlay ──────────────────────────────────────────────────────────────
 
 pub fn help_overlay(frame: &mut Frame, area: Rect) {
-    // Centre a fixed-size popup.
-    let popup = centered_rect(50, 14, area);
+    let bindings: &[(&str, &str)] = &[
+        ("Global", ""),
+        ("Tab / Shift-Tab", "Switch tabs"),
+        ("j / ↓  k / ↑", "Move cursor"),
+        ("s", "Connect / disconnect"),
+        ("r / R", "Restart core (r refreshes on Dashboard)"),
+        ("? / F1 / Esc", "Toggle this help"),
+        ("q / Ctrl-q / Ctrl-c", "Quit (disconnects first)"),
+        ("Dashboard", ""),
+        ("r", "Refresh exit IP and latency"),
+        ("Configs", ""),
+        ("a", "Add link or outbound JSON"),
+        ("i", "Import subscription URL"),
+        ("e / d", "Rename / delete selected"),
+        ("t", "TCP-ping all configs"),
+        ("Enter", "Set selected config active"),
+        ("Apps", ""),
+        ("a", "Add rule (app or domain)"),
+        ("Enter / Space", "Cycle action / add seen app"),
+        ("d / m", "Delete rule / toggle default mode"),
+        ("Logs", ""),
+        ("PageUp / PageDown", "Scroll one page"),
+        ("Home / End", "Oldest line / newest + follow"),
+        ("f", "Toggle follow tail"),
+        ("Prompts", ""),
+        ("Enter / Esc", "Submit / cancel; paste works"),
+    ];
+
+    // Centre the popup; borders take two rows.
+    let popup = centered_rect(60, bindings.len() as u16 + 2, area);
 
     // Clear the background first so the popup sits on top.
     frame.render_widget(Clear, popup);
@@ -739,24 +792,18 @@ pub fn help_overlay(frame: &mut Frame, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let bindings: &[(&str, &str)] = &[
-        ("q / Ctrl-q / Ctrl-c", "Quit"),
-        ("Tab / Shift-Tab",      "Switch tabs"),
-        ("j / ↓  k / ↑",        "Move cursor"),
-        ("Enter",                "Set selected config active"),
-        ("a / e / d / t",        "Configs: add/rename/delete/ping"),
-        ("a / Enter / d / m",    "Apps: add/cycle/delete/mode"),
-        ("s",                    "Start / stop proxy"),
-        ("r",                    "Dashboard: refresh IP/latency"),
-        ("R / r (other tabs)",   "Restart proxy"),
-        ("?  / F1",              "Toggle this help"),
-    ];
-
     let rows: Vec<Row> = bindings
         .iter()
         .map(|(key, desc)| {
+            if desc.is_empty() {
+                return Row::new(vec![Cell::from(*key).style(
+                    Style::default()
+                        .fg(palette::WARNING)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                )]);
+            }
             Row::new(vec![
-                Cell::from(*key).style(
+                Cell::from(format!("  {key}")).style(
                     Style::default()
                         .fg(palette::ACCENT)
                         .add_modifier(Modifier::BOLD),
@@ -768,7 +815,7 @@ pub fn help_overlay(frame: &mut Frame, area: Rect) {
 
     let table = Table::new(
         rows,
-        [Constraint::Percentage(50), Constraint::Percentage(50)],
+        [Constraint::Percentage(40), Constraint::Percentage(60)],
     )
     .style(Style::default().bg(palette::RAISED))
     .column_spacing(2);

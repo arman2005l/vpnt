@@ -86,9 +86,15 @@ const SINGBOX_BIN: &str = "sing-box";
 
 /// True when the effective user is root (Linux/macOS) or an Administrator
 /// (Windows stub — always false; TUN on Windows needs a separate elevation
-/// flow that is out of scope for M1).
+/// flow that is not implemented).
+#[cfg(not(windows))]
 pub fn is_root() -> bool {
     effective_uid() == 0
+}
+
+#[cfg(windows)]
+pub fn is_root() -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -105,9 +111,29 @@ fn effective_uid() -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn effective_uid() -> u32 {
     u32::MAX // non-root on platforms we do not need TUN for in M1
+}
+
+// ── Process stop ──────────────────────────────────────────────────────────────
+
+/// Ask process `pid` to exit gracefully.
+///
+/// Returns `true` if a graceful request was sent.  `false` means the caller
+/// must force-kill (always the case on Windows, which has no SIGTERM).
+#[cfg(unix)]
+pub fn request_terminate(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) only sends a signal; it touches no memory of ours.
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+}
+
+#[cfg(windows)]
+pub fn request_terminate(_pid: u32) -> bool {
+    false
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

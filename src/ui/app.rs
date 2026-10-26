@@ -3,6 +3,7 @@
 //! `AppState` is the single source of truth for the TUI.  It is not
 //! async-aware itself; callers in the event loop drive it with `.handle()`.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -65,7 +66,21 @@ pub enum Action {
     DeleteRule,
     /// Apps tab: toggle rules.json default_mode.
     ToggleDefaultMode,
+    /// Configs tab: open the subscription URL prompt.
+    ImportSubscription,
+    /// Logs tab: scroll one page up / down.
+    LogPageUp,
+    LogPageDown,
+    /// Logs tab: jump to the oldest line.
+    LogHome,
+    /// Logs tab: jump to the newest line and follow.
+    LogEnd,
+    /// Logs tab: toggle following the tail.
+    LogFollow,
 }
+
+/// Outcome of a background subscription fetch: links, or an error message.
+type ImportResult = Result<Vec<String>, String>;
 
 /// Modal input state for the Configs tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +93,8 @@ pub enum InputMode {
     AddingRule(String),
     /// Apps tab: rules changed while connected; apply and restart?
     ConfirmApplyRules,
+    /// Configs tab: typing a subscription URL.
+    Importing(String),
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -134,8 +151,16 @@ pub struct AppState {
     pub proxy_cursor: usize,
     pub show_help: bool,
 
-    /// Ring-buffer of log lines forwarded from the tracing layer (M2).
+    /// Copy of the core's log ring buffer, refreshed every tick.
     pub log_lines: Vec<String>,
+    /// Absolute index of `log_lines[0]` (lines dropped from the ring so far).
+    pub log_first_index: u64,
+    /// Absolute index of the top visible line when not following.
+    pub log_top: u64,
+    /// Keep the view pinned to the newest line.
+    pub log_follow: bool,
+    /// Rows available to the log view, recorded by the last draw.
+    pub log_view_height: Cell<usize>,
 
     /// Non-fatal notices shown in the status bar (cleared on next tick).
     pub notice: Option<String>,
@@ -161,6 +186,10 @@ pub struct AppState {
     pub seen_apps: Vec<String>,
     /// Rules changed while connected but not applied to the running core.
     pub rules_pending: bool,
+    /// True while a subscription fetch is in flight.
+    pub importing: bool,
+    import_tx: mpsc::UnboundedSender<ImportResult>,
+    import_rx: mpsc::UnboundedReceiver<ImportResult>,
 }
 
 impl AppState {
@@ -184,6 +213,7 @@ impl AppState {
         }
         let (ping_tx, ping_rx) = mpsc::unbounded_channel();
         let (dash_tx, dash_rx) = mpsc::unbounded_channel();
+        let (import_tx, import_rx) = mpsc::unbounded_channel();
         let mut notice = None;
         let rules = config::load_rules(&data_dir).unwrap_or_else(|e| {
             tracing::warn!("could not load rules: {e:#}; using defaults");
@@ -200,6 +230,10 @@ impl AppState {
             proxy_cursor: 0,
             show_help: false,
             log_lines: Vec::new(),
+            log_first_index: 0,
+            log_top: 0,
+            log_follow: true,
+            log_view_height: Cell::new(1),
             notice_at: notice.as_ref().map(|_| Instant::now()),
             notice,
             input_mode: InputMode::Normal,
@@ -214,6 +248,9 @@ impl AppState {
             apps_cursor: 0,
             seen_apps: Vec::new(),
             rules_pending: false,
+            importing: false,
+            import_tx,
+            import_rx,
         }
     }
 
@@ -262,6 +299,39 @@ impl AppState {
             }
             Action::DeleteRule => self.delete_rule().await,
             Action::ToggleDefaultMode => self.toggle_default_mode().await,
+            Action::ImportSubscription => {
+                if self.active_tab == Tab::Proxies {
+                    if self.importing {
+                        self.set_notice("Import already running…");
+                    } else {
+                        self.input_mode = InputMode::Importing(String::new());
+                    }
+                }
+            }
+            Action::LogPageUp => {
+                let page = self.log_page();
+                self.scroll_logs(-(page as i64));
+            }
+            Action::LogPageDown => {
+                let page = self.log_page();
+                self.scroll_logs(page as i64);
+            }
+            Action::LogHome => {
+                self.log_follow = false;
+                self.log_top = self.log_first_index;
+            }
+            Action::LogEnd => self.log_follow = true,
+            Action::LogFollow => {
+                if self.log_follow {
+                    let start = self.log_start(self.log_page());
+                    self.log_top = self.log_first_index + start as u64;
+                    self.log_follow = false;
+                    self.set_notice("Log follow off.");
+                } else {
+                    self.log_follow = true;
+                    self.set_notice("Log follow on.");
+                }
+            }
             Action::InputChar(c) if self.input_mode == InputMode::ConfirmApplyRules => {
                 self.input_mode = InputMode::Normal;
                 if c == 'y' || c == 'Y' {
@@ -272,8 +342,10 @@ impl AppState {
             }
             Action::InputChar(c) => self.input_char(c),
             Action::InputBackspace => {
-                if let InputMode::Adding(buf) | InputMode::Renaming(buf) | InputMode::AddingRule(buf) =
-                    &mut self.input_mode
+                if let InputMode::Adding(buf)
+                | InputMode::Renaming(buf)
+                | InputMode::AddingRule(buf)
+                | InputMode::Importing(buf) = &mut self.input_mode
                 {
                     buf.pop();
                 }
@@ -288,8 +360,10 @@ impl AppState {
             }
             Action::InputCancel => self.input_mode = InputMode::Normal,
             Action::Paste(text) => {
-                if let InputMode::Adding(buf) | InputMode::Renaming(buf) | InputMode::AddingRule(buf) =
-                    &mut self.input_mode
+                if let InputMode::Adding(buf)
+                | InputMode::Renaming(buf)
+                | InputMode::AddingRule(buf)
+                | InputMode::Importing(buf) = &mut self.input_mode
                 {
                     buf.push_str(text.trim());
                 }
@@ -318,6 +392,12 @@ impl AppState {
         while let Ok(results) = self.ping_rx.try_recv() {
             self.apply_ping_results(results);
         }
+        while let Ok(result) = self.import_rx.try_recv() {
+            self.apply_import(result);
+        }
+        let snap = self.supervisor.log_snapshot();
+        self.log_lines = snap.lines;
+        self.log_first_index = snap.first_index;
         if let Some(at) = self.notice_at {
             if at.elapsed() >= NOTICE_TTL {
                 self.notice = None;
@@ -343,9 +423,10 @@ impl AppState {
 
     fn input_char(&mut self, c: char) {
         match &mut self.input_mode {
-            InputMode::Adding(buf) | InputMode::Renaming(buf) | InputMode::AddingRule(buf) => {
-                buf.push(c)
-            }
+            InputMode::Adding(buf)
+            | InputMode::Renaming(buf)
+            | InputMode::AddingRule(buf)
+            | InputMode::Importing(buf) => buf.push(c),
             InputMode::ConfirmDelete => match c {
                 'y' | 'Y' => self.delete_selected(),
                 _ => {
@@ -362,6 +443,7 @@ impl AppState {
         match mode {
             InputMode::Adding(text) => self.add_config(&text),
             InputMode::Renaming(text) => self.rename_selected(&text),
+            InputMode::Importing(text) => self.start_import(&text),
             InputMode::ConfirmDelete => self.input_mode = InputMode::ConfirmDelete,
             InputMode::ConfirmApplyRules => self.input_mode = InputMode::ConfirmApplyRules,
             InputMode::AddingRule(_) | InputMode::Normal => {}
@@ -445,6 +527,64 @@ impl AppState {
             let results = net::ping_all(targets, net::PING_TIMEOUT).await;
             let _ = tx.send(results);
         });
+    }
+
+    // ── Subscription import ───────────────────────────────────────────────
+
+    fn start_import(&mut self, text: &str) {
+        let url = text.trim().to_string();
+        if url.is_empty() {
+            self.set_notice("No URL given.");
+            return;
+        }
+        self.importing = true;
+        self.set_notice("Fetching subscription…");
+        let tx = self.import_tx.clone();
+        tokio::spawn(async move {
+            let result = net::fetch_subscription(&url).await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn apply_import(&mut self, result: ImportResult) {
+        self.importing = false;
+        let links = match result {
+            Ok(links) => links,
+            Err(e) => {
+                self.set_notice(format!("Import failed: {e}"));
+                return;
+            }
+        };
+        let (imported, skipped) = import_links(&mut self.store.proxies, &links);
+        if imported > 0 && !self.persist() {
+            return;
+        }
+        self.set_notice(format!("imported {imported}, skipped {skipped}"));
+    }
+
+    // ── Logs tab ──────────────────────────────────────────────────────────
+
+    fn log_page(&self) -> usize {
+        self.log_view_height.get().max(1)
+    }
+
+    /// Index into `log_lines` of the first visible row for a view of `height`.
+    pub fn log_start(&self, height: usize) -> usize {
+        let max_start = self.log_lines.len().saturating_sub(height);
+        if self.log_follow {
+            return max_start;
+        }
+        let rel = self.log_top.saturating_sub(self.log_first_index);
+        usize::try_from(rel).unwrap_or(usize::MAX).min(max_start)
+    }
+
+    fn scroll_logs(&mut self, delta: i64) {
+        let page = self.log_page();
+        let max_start = self.log_lines.len().saturating_sub(page) as i64;
+        let start = self.log_start(page) as i64;
+        let next = (start + delta).clamp(0, max_start);
+        self.log_top = self.log_first_index + next as u64;
+        self.log_follow = next >= max_start && delta > 0;
     }
 
     fn apply_ping_results(&mut self, results: Vec<(String, Option<u64>)>) {
@@ -780,6 +920,34 @@ pub fn proxy_from_link(text: &str) -> anyhow::Result<ProxyConfig> {
     })
 }
 
+/// Parse `links` and append the valid ones to `proxies`.
+///
+/// Invalid links and duplicates (same name, protocol, server and port as an
+/// existing config) are skipped.  Returns `(imported, skipped)`.
+pub fn import_links(proxies: &mut Vec<ProxyConfig>, links: &[String]) -> (usize, usize) {
+    let mut imported = 0;
+    let mut skipped = 0;
+    for link in links {
+        let Ok(proxy) = proxy_from_link(link) else {
+            skipped += 1;
+            continue;
+        };
+        let duplicate = proxies.iter().any(|p| {
+            p.name == proxy.name
+                && p.protocol == proxy.protocol
+                && p.address == proxy.address
+                && p.port == proxy.port
+        });
+        if duplicate {
+            skipped += 1;
+        } else {
+            proxies.push(proxy);
+            imported += 1;
+        }
+    }
+    (imported, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +966,43 @@ mod tests {
     #[test]
     fn proxy_from_bad_link_is_error() {
         assert!(proxy_from_link("garbage").is_err());
+    }
+
+    #[test]
+    fn import_links_counts_and_dedupes() {
+        let mut proxies = Vec::new();
+        let links = vec![
+            "hy2://pw@a.example:443#a".to_string(),
+            "garbage".to_string(),
+            "hy2://pw@a.example:443#a".to_string(),
+            "hy2://pw@b.example:443#b".to_string(),
+        ];
+        assert_eq!(import_links(&mut proxies, &links), (2, 2));
+        assert_eq!(proxies.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn log_scrolling_and_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = make_app(tmp.path());
+        app.log_lines = (0..100).map(|i| format!("l{i}")).collect();
+        app.log_view_height.set(10);
+        assert_eq!(app.log_start(10), 90);
+        app.handle(Action::LogPageUp).await;
+        assert!(!app.log_follow);
+        assert_eq!(app.log_start(10), 80);
+        app.handle(Action::LogHome).await;
+        assert_eq!(app.log_start(10), 0);
+        app.log_lines.push("new".into());
+        assert_eq!(app.log_start(10), 0);
+        app.handle(Action::LogPageDown).await;
+        assert_eq!(app.log_start(10), 10);
+        app.handle(Action::LogEnd).await;
+        assert!(app.log_follow);
+        assert_eq!(app.log_start(10), 91);
+        app.handle(Action::LogFollow).await;
+        assert!(!app.log_follow);
+        assert_eq!(app.log_start(10), 91);
         assert!(proxy_from_link("{\"server\":\"x\"}").is_err());
     }
 
