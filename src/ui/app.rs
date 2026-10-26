@@ -161,6 +161,8 @@ pub struct AppState {
     pub log_follow: bool,
     /// Rows available to the log view, recorded by the last draw.
     pub log_view_height: Cell<usize>,
+    /// Columns available to log text (lines wrap at this width).
+    pub log_wrap_width: Cell<usize>,
 
     /// Non-fatal notices shown in the status bar (cleared on next tick).
     pub notice: Option<String>,
@@ -234,6 +236,7 @@ impl AppState {
             log_top: 0,
             log_follow: true,
             log_view_height: Cell::new(1),
+            log_wrap_width: Cell::new(usize::MAX),
             notice_at: notice.as_ref().map(|_| Instant::now()),
             notice,
             input_mode: InputMode::Normal,
@@ -568,9 +571,34 @@ impl AppState {
         self.log_view_height.get().max(1)
     }
 
-    /// Index into `log_lines` of the first visible row for a view of `height`.
+    /// Screen rows `line` takes once wrapped to the current width.
+    fn log_rows(&self, line: &str) -> usize {
+        let width = self.log_wrap_width.get().max(1);
+        line.chars().count().div_ceil(width).max(1)
+    }
+
+    /// Largest first-line index such that the tail still fills `height` rows.
+    pub fn log_start_max(&self, height: usize) -> usize {
+        let mut rows = 0;
+        let mut start = self.log_lines.len();
+        while start > 0 {
+            let next = rows + self.log_rows(&self.log_lines[start - 1]);
+            if next > height {
+                break;
+            }
+            rows = next;
+            start -= 1;
+        }
+        // A single line taller than the view: show its beginning.
+        if start == self.log_lines.len() && start > 0 {
+            start -= 1;
+        }
+        start
+    }
+
+    /// Index into `log_lines` of the first visible line for a view of `height`.
     pub fn log_start(&self, height: usize) -> usize {
-        let max_start = self.log_lines.len().saturating_sub(height);
+        let max_start = self.log_start_max(height);
         if self.log_follow {
             return max_start;
         }
@@ -578,11 +606,27 @@ impl AppState {
         usize::try_from(rel).unwrap_or(usize::MAX).min(max_start)
     }
 
+    /// Move the top by about `delta` screen rows (whole lines; at least one).
     fn scroll_logs(&mut self, delta: i64) {
         let page = self.log_page();
-        let max_start = self.log_lines.len().saturating_sub(page) as i64;
-        let start = self.log_start(page) as i64;
-        let next = (start + delta).clamp(0, max_start);
+        let max_start = self.log_start_max(page);
+        let mut next = self.log_start(page);
+        let mut budget = delta.unsigned_abs() as usize;
+        while budget > 0 {
+            if delta < 0 {
+                if next == 0 {
+                    break;
+                }
+                next -= 1;
+            } else {
+                if next >= max_start {
+                    break;
+                }
+                next += 1;
+            }
+            let rows = self.log_lines.get(next).map(|l| self.log_rows(l)).unwrap_or(1);
+            budget = budget.saturating_sub(rows);
+        }
         self.log_top = self.log_first_index + next as u64;
         self.log_follow = next >= max_start && delta > 0;
     }
@@ -1003,6 +1047,20 @@ mod tests {
         app.handle(Action::LogFollow).await;
         assert!(!app.log_follow);
         assert_eq!(app.log_start(10), 91);
+    }
+
+    #[tokio::test]
+    async fn log_tail_accounts_for_wrapped_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = make_app(tmp.path());
+        app.log_lines = (0..20).map(|i| format!("l{i}")).collect();
+        app.log_lines.push("x".repeat(25));
+        app.log_view_height.set(5);
+        app.log_wrap_width.set(10);
+        assert_eq!(app.log_start(5), 18);
+        app.log_lines.push("y".repeat(100));
+        assert_eq!(app.log_start(5), 21);
+        assert_eq!(crate::ui::widgets::wrap_chars(&"z".repeat(25), 10).len(), 3);
         assert!(proxy_from_link("{\"server\":\"x\"}").is_err());
     }
 

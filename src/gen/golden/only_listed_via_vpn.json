@@ -3,8 +3,15 @@
     "final": "dns-remote",
     "rules": [
       {
-        "rule_set": [
-          "geosite-private"
+        "domain": [
+          "localhost"
+        ],
+        "domain_suffix": [
+          "localhost",
+          "local",
+          "lan",
+          "internal",
+          "home.arpa"
         ],
         "server": "dns-local"
       }
@@ -69,29 +76,6 @@
     "default_domain_resolver": "dns-local",
     "final": "direct",
     "find_process": true,
-    "rule_set": [
-      {
-        "format": "binary",
-        "tag": "geosite-private",
-        "type": "remote",
-        "update_interval": "7d",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-private.srs"
-      },
-      {
-        "format": "binary",
-        "tag": "geosite-category-ads-all",
-        "type": "remote",
-        "update_interval": "7d",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs"
-      },
-      {
-        "format": "binary",
-        "tag": "geoip-private",
-        "type": "remote",
-        "update_interval": "7d",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-private.srs"
-      }
-    ],
     "rules": [
       {
         "action": "sniff"
@@ -101,13 +85,20 @@
         "protocol": "dns"
       },
       {
-        "action": "reject",
-        "rule_set": [
-          "geosite-category-ads-all"
-        ]
+        "ip_is_private": true,
+        "outbound": "direct"
       },
       {
-        "ip_is_private": true,
+        "domain": [
+          "localhost"
+        ],
+        "domain_suffix": [
+          "localhost",
+          "local",
+          "lan",
+          "internal",
+          "home.arpa"
+        ],
         "outbound": "direct"
       },
       {

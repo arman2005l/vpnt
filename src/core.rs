@@ -103,6 +103,11 @@ struct Inner {
     config_path: PathBuf,
     child:       Option<Child>,
     status:      Status,
+    /// Stderr reader of the current child; awaited after exit so the final
+    /// lines (usually the FATAL one) are in the ring before we report.
+    reader:      Option<tokio::task::JoinHandle<()>>,
+    /// Ring index (absolute) of the first line produced by the current child.
+    run_start:   u64,
 }
 
 // ── Supervisor impl ───────────────────────────────────────────────────────────
@@ -119,6 +124,8 @@ impl Supervisor {
                 config_path,
                 child: None,
                 status: Status::Stopped,
+                reader: None,
+                run_start: 0,
             })),
             log: SharedLog::default(),
         }
@@ -211,13 +218,19 @@ impl Supervisor {
         };
         match child.try_wait() {
             Ok(Some(exit)) => {
-                let msg = if exit.success() {
-                    "exited with status 0".into()
+                if let Some(reader) = g.reader.take() {
+                    let _ = tokio::time::timeout(Duration::from_millis(500), reader).await;
+                }
+                let exit_text = if exit.success() {
+                    "exited with status 0".to_string()
                 } else {
                     format!("exited: {exit}")
                 };
-                warn!("sing-box {}", msg);
-                push_log(&self.log, &format!("[vpnt] sing-box {msg}"));
+                warn!("sing-box {}", exit_text);
+                push_log(&self.log, &format!("[vpnt] sing-box {exit_text}"));
+                let msg = self
+                    .last_fatal_since(g.run_start)
+                    .unwrap_or_else(|| format!("sing-box {exit_text}"));
                 g.child = None;
                 g.status = Status::Failed(msg);
                 false
@@ -230,9 +243,38 @@ impl Supervisor {
             }
         }
     }
+
+    /// Last FATAL (or else ERROR) line logged since ring index `since`,
+    /// with the level/timestamp prefix stripped.
+    fn last_fatal_since(&self, since: u64) -> Option<String> {
+        let snap = self.log_snapshot();
+        let skip = usize::try_from(since.saturating_sub(snap.first_index)).unwrap_or(usize::MAX);
+        let lines: Vec<&String> = snap.lines.iter().skip(skip).collect();
+        let pick = |level: &str| {
+            lines.iter().rev().find_map(|l| strip_level_prefix(l, level))
+        };
+        pick("FATAL").or_else(|| pick("ERROR"))
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// If `line` contains a `LEVEL[...]` / `LEVEL` marker, return the message after
+/// it.  Handles sing-box lines with or without a leading timestamp.
+fn strip_level_prefix(line: &str, level: &str) -> Option<String> {
+    let pos = line.find(level)?;
+    let rest = &line[pos + level.len()..];
+    let rest = match rest.strip_prefix('[') {
+        Some(after) => after.split_once(']').map(|(_, msg)| msg).unwrap_or(after),
+        None => rest,
+    };
+    let msg = rest.trim();
+    if msg.is_empty() {
+        None
+    } else {
+        Some(msg.to_string())
+    }
+}
 
 /// Pick the most useful line of `sing-box check` output.
 fn check_error_message(output: &str) -> String {
@@ -280,9 +322,10 @@ fn spawn_child(g: &mut Inner, log: &SharedLog) -> Result<()> {
     let pid = child.id().unwrap_or(0);
     info!("sing-box started (pid {pid})");
     push_log(log, &format!("[vpnt] sing-box started (pid {pid})"));
+    g.run_start = log_end_index(log);
 
     // Pipe stderr into the ring buffer (and tracing) in a background task.
-    if let Some(stderr) = child.stderr.take() {
+    g.reader = child.stderr.take().map(|stderr| {
         let log = log.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -290,12 +333,20 @@ fn spawn_child(g: &mut Inner, log: &SharedLog) -> Result<()> {
                 tracing::debug!(target: "singbox", "{line}");
                 push_log(&log, &line);
             }
-        });
-    }
+        })
+    });
 
     g.status = Status::Running(pid);
     g.child = Some(child);
     Ok(())
+}
+
+/// Absolute ring index that the next pushed line will get.
+fn log_end_index(log: &SharedLog) -> u64 {
+    match log.lock() {
+        Ok(ring) => ring.dropped + ring.lines.len() as u64,
+        Err(_) => 0,
+    }
 }
 
 /// Best-effort graceful termination.
@@ -387,6 +438,56 @@ mod tests {
     #[test]
     fn sanitize_strips_ansi() {
         assert_eq!(sanitize_log_line("\u{1b}[36mINFO\u{1b}[0m a\tb"), "INFO a    b");
+    }
+
+    #[test]
+    fn last_fatal_is_reported_from_current_run_only() {
+        let sv = make_supervisor();
+        push_log(&sv.log, "FATAL[0000] old run failure");
+        let start = log_end_index(&sv.log);
+        push_log(&sv.log, "+0330 2026-10-26 10:00:00 INFO router: starting");
+        push_log(&sv.log, "+0330 2026-10-26 10:00:00 ERROR something minor");
+        push_log(
+            &sv.log,
+            "+0330 2026-10-26 10:00:01 FATAL[0001] start service: start router: boom",
+        );
+        push_log(&sv.log, "[vpnt] sing-box exited: exit status: 1");
+        assert_eq!(
+            sv.last_fatal_since(start).as_deref(),
+            Some("start service: start router: boom")
+        );
+        let later = log_end_index(&sv.log);
+        push_log(&sv.log, "ERROR[0000] only error");
+        assert_eq!(sv.last_fatal_since(later).as_deref(), Some("only error"));
+        let none = log_end_index(&sv.log);
+        assert_eq!(sv.last_fatal_since(none), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_failure_reports_fatal_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-sing-box");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'FATAL[0000] start service: initialize rule-set[0]: boom' >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sv = Supervisor::new(script, dir.path().join("config.json"));
+        sv.start().await.unwrap();
+        for _ in 0..50 {
+            if !sv.poll().await {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            sv.status().await,
+            Status::Failed("start service: initialize rule-set[0]: boom".into())
+        );
+        assert!(!sv.poll().await, "must not restart by itself");
     }
 
     #[tokio::test]

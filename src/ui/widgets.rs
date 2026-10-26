@@ -109,19 +109,26 @@ pub fn status_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     let dash = &state.dashboard;
     let connected = matches!(state.proc_status, Status::Running(_)) && dash.connected_at.is_some();
 
-    let [info_area, body_area] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(0)])
-        .areas(inner);
-
     let label = |s: &'static str| Span::styled(format!("{s:<10}"), Style::default().fg(palette::MUTED));
     let value = |s: String| Span::styled(s, Style::default().fg(palette::BODY));
 
     let sc = status_color(&state.proc_status);
-    let status_text = if connected { "Connected".to_string() } else { match &state.proc_status {
-        Status::Failed(msg) => format!("Disconnected ({msg})"),
-        _ => "Disconnected".to_string(),
-    }};
+    let failed = matches!(state.proc_status, Status::Failed(_));
+    let status_text = if connected {
+        "Connected".to_string()
+    } else {
+        match &state.proc_status {
+            Status::Failed(msg) => format!("Error: {msg}"),
+            _ => "Disconnected".to_string(),
+        }
+    };
+    // Status may be a long error: give it as many rows as it wraps to.
+    let width = (inner.width as usize).max(1);
+    let status_rows = (10 + status_text.chars().count()).div_ceil(width).clamp(1, 8);
+    let [info_area, body_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(status_rows as u16 + 3), Constraint::Min(0)])
+        .areas(inner);
     let config_name = state
         .active_proxy()
         .map(|p| p.name.clone())
@@ -140,13 +147,19 @@ pub fn status_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![label("Config"), value(config_name)]),
         Line::from(vec![label("Uptime"), value(uptime)]),
     ];
-    frame.render_widget(Paragraph::new(info), info_area);
+    frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: false }), info_area);
 
     if !connected {
+        let hint = if failed {
+            "sing-box stopped during startup. Full output is in the Logs tab.  Press s to retry."
+        } else {
+            "Disconnected.  Press s to connect."
+        };
         frame.render_widget(
-            Paragraph::new("Disconnected.  Press s to connect.")
+            Paragraph::new(hint)
                 .style(Style::default().fg(palette::MUTED))
-                .alignment(Alignment::Center),
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false }),
             body_area,
         );
         return;
@@ -656,7 +669,10 @@ pub fn log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(block, area);
 
     let height = (inner.height as usize).max(1);
+    // Reserve the scrollbar column up front so wrapping is stable.
+    let wrap_width = (inner.width as usize).saturating_sub(1).max(1);
     state.log_view_height.set(height);
+    state.log_wrap_width.set(wrap_width);
     let start = state.log_start(height);
 
     if total == 0 {
@@ -672,42 +688,50 @@ pub fn log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         .log_lines
         .iter()
         .skip(start)
-        .take(height)
-        .map(|l| {
+        .flat_map(|l| {
             // Colour lines that start with known level prefixes.
-            let style = if l.contains("ERROR") || l.contains("error") {
+            let style = if l.contains("FATAL") || l.contains("ERROR") || l.contains("error") {
                 Style::default().fg(palette::DANGER)
             } else if l.contains("WARN") || l.contains("warn") {
                 Style::default().fg(palette::WARNING)
             } else {
                 Style::default().fg(palette::BODY)
             };
-            Line::from(Span::styled(l.clone(), style))
+            wrap_chars(l, wrap_width)
+                .into_iter()
+                .map(move |row| Line::from(Span::styled(row, style)))
         })
+        .take(height)
         .collect();
 
     let para = Paragraph::new(Text::from(lines)).style(Style::default().bg(palette::SURFACE));
 
-    // Scrollbar only when content overflows.
-    if total > height {
-        let scroll_area = inner;
-        let [text_area, bar_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .areas(scroll_area);
+    let [text_area, bar_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .areas(inner);
+    frame.render_widget(para, text_area);
 
-        frame.render_widget(para, text_area);
-
-        let mut sb_state = ScrollbarState::new(total.saturating_sub(height) + 1).position(start);
+    let max_start = state.log_start_max(height);
+    if max_start > 0 {
+        let mut sb_state = ScrollbarState::new(max_start + 1).position(start);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(Style::default().fg(palette::BORDER)),
             bar_area,
             &mut sb_state,
         );
-    } else {
-        frame.render_widget(para, inner);
     }
+}
+
+/// Split `line` into rows of at most `width` characters (char-based wrap,
+/// so long tokens like URLs are never cut off).  Empty lines give one row.
+pub fn wrap_chars(line: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if width == 0 || chars.is_empty() {
+        return vec![line.to_string()];
+    }
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────

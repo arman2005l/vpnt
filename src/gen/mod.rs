@@ -20,6 +20,16 @@ use crate::config::{
 /// Path relative to `data_dir` where the generated config is written.
 pub const CONFIG_FILENAME: &str = "config.json";
 
+/// Tag of the DNS server used for local names and for resolving the proxy
+/// server's own hostname (sent direct, never through the proxy).
+const DNS_LOCAL: &str = "dns-local";
+
+/// Exact local host names that must never leave the machine.
+const LOCAL_DOMAINS: &[&str] = &["localhost"];
+
+/// Local / LAN suffixes routed direct and resolved by `DNS_LOCAL`.
+const LOCAL_DOMAIN_SUFFIXES: &[&str] = &["localhost", "local", "lan", "internal", "home.arpa"];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Build a complete sing-box config and write it atomically to
@@ -118,10 +128,11 @@ fn build_log(settings: &Settings) -> Value {
 // ── DNS ───────────────────────────────────────────────────────────────────────
 
 fn build_dns() -> Value {
-    // New-style (sing-box >= 1.12) servers:
+    // New-style (sing-box >= 1.12) servers, both addressed by IP so that no
+    // bootstrap lookup is needed:
     //   - dns-remote: DoH through the proxy for everything else
-    //   - dns-local:  DoH sent direct, used for private names and for
-    //                 resolving outbound server addresses
+    //   - dns-local:  DoH sent direct, used for local names and for
+    //                 resolving the proxy server's hostname (no loop)
     json!({
         "servers": [
             {
@@ -132,15 +143,22 @@ fn build_dns() -> Value {
             },
             {
                 "type":   "https",
-                "tag":    "dns-local",
+                "tag":    DNS_LOCAL,
                 "server": "223.5.5.5",
             },
         ],
         "rules": [
-            { "rule_set": ["geosite-private"], "server": "dns-local" },
+            local_names_matcher(json!({ "server": DNS_LOCAL })),
         ],
         "final": "dns-remote",
     })
+}
+
+/// Add the built-in local-name matchers (`domain` + `domain_suffix`) to `rule`.
+fn local_names_matcher(mut rule: Value) -> Value {
+    rule["domain"] = json!(LOCAL_DOMAINS);
+    rule["domain_suffix"] = json!(LOCAL_DOMAIN_SUFFIXES);
+    rule
 }
 
 // ── Inbounds ──────────────────────────────────────────────────────────────────
@@ -175,6 +193,10 @@ fn build_outbounds(proxy: &ProxyConfig) -> Value {
     let mut primary = proxy.outbound.clone();
     // Ensure the tag is "proxy" so routing rules can reference it by name.
     primary["tag"] = json!("proxy");
+    // A hostname server must be resolved direct, never through itself.
+    if primary.is_object() {
+        pin_server_ip(&mut primary);
+    }
     list.push(primary);
 
     // Built-in utility outbounds.
@@ -192,19 +214,15 @@ fn build_route(proxy: &ProxyConfig, settings: &Settings, user: &RulesConfig) -> 
     rules.push(json!({ "action": "sniff" }));
     rules.push(json!({ "protocol": "dns", "action": "hijack-dns" }));
 
-    // 2. Block ad/malware rule-sets.
-    rules.push(json!({
-        "rule_set": ["geosite-category-ads-all"],
-        "action":   "reject",
-    }));
-
-    // 3. Direct: private addresses + LAN.
+    // 2. Direct: private addresses and local names, using built-in matchers
+    //    only (no rule-sets: nothing may be downloaded at startup).
     rules.push(json!({
         "ip_is_private": true,
         "outbound":      "direct",
     }));
+    rules.push(local_names_matcher(json!({ "outbound": "direct" })));
 
-    // 4. rules.json, in order.
+    // 3. rules.json, in order.
     for rule in &user.rules {
         let mut entry = match rule.kind {
             AppRuleKind::ProcessName => json!({ "process_name": [rule.value.as_str()] }),
@@ -214,22 +232,25 @@ fn build_route(proxy: &ProxyConfig, settings: &Settings, user: &RulesConfig) -> 
         rules.push(entry);
     }
 
-    // 5. Legacy per-config rules from the RulesFile list.
+    // 4. Legacy per-config rules from the RulesFile list.  GeoSite/GeoIp
+    //    rules needed remote rule-sets and are skipped.
     for rf in &proxy.rules_files {
         for rule in &rf.rules {
             let mut entry = match rule.kind {
                 RuleKind::Domain => json!({ "domain_suffix": [rule.pattern.as_str()] }),
                 RuleKind::DomainFull => json!({ "domain": [rule.pattern.as_str()] }),
                 RuleKind::IpCidr => json!({ "ip_cidr": [rule.pattern.as_str()] }),
-                RuleKind::GeoSite => json!({ "rule_set": [format!("geosite-{}", rule.pattern)] }),
-                RuleKind::GeoIp => json!({ "rule_set": [format!("geoip-{}", rule.pattern)] }),
+                RuleKind::GeoSite | RuleKind::GeoIp => {
+                    tracing::warn!("skipping {:?} rule: rule-sets are not supported", rule.kind);
+                    continue;
+                }
             };
             apply_action(&mut entry, &rule.action);
             rules.push(entry);
         }
     }
 
-    // 6. Final: only_listed_via_vpn sends everything else direct; otherwise
+    // 5. Final: only_listed_via_vpn sends everything else direct; otherwise
     //    the legacy Settings.default_mode decides (Proxy by default).
     let final_action = match user.default_mode {
         RoutingMode::OnlyListedViaVpn => RuleAction::Direct,
@@ -250,10 +271,9 @@ fn build_route(proxy: &ProxyConfig, settings: &Settings, user: &RulesConfig) -> 
     json!({
         "rules":     rules,
         "final":     final_tag,
-        "rule_set":  build_rule_sets(),
         "find_process": true,
         "auto_detect_interface": true,
-        "default_domain_resolver": "dns-local",
+        "default_domain_resolver": DNS_LOCAL,
     })
 }
 
@@ -265,43 +285,51 @@ fn apply_action(entry: &mut Value, action: &RuleAction) {
         RuleAction::Block => entry["action"] = json!("reject"),
     }
 }
+/// Resolve the proxy server's host name with the system resolver and pin the IP
+/// in the outbound, keeping the original name as TLS SNI / WebSocket Host so the
+/// handshake still matches. Runs before the tunnel exists.
+fn pin_server_ip(outbound: &mut Value) {
+    use std::net::{IpAddr, ToSocketAddrs};
 
-// ── Rule-set descriptors ──────────────────────────────────────────────────────
+    let host = match outbound.get("server").and_then(|v| v.as_str()) {
+        Some(h) => h.to_string(),
+        None => return,
+    };
+    if host.parse::<IpAddr>().is_ok() {
+        return;
+    }
+    let port = outbound
+        .get("server_port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(443) as u16;
+    let ip = match (host.as_str(), port).to_socket_addrs() {
+        Ok(addrs) => addrs.into_iter().find(|a| a.is_ipv4()).map(|a| a.ip()),
+        Err(_) => None,
+    };
+    let ip = match ip {
+        Some(ip) => ip,
+        None => return,
+    };
+    outbound["server"] = json!(ip.to_string());
 
-/// Declare the remote rule-sets we reference in routing/DNS.
-/// sing-box will download these on first run if `experimental.cache_file`
-/// is enabled; if absent the rules that reference them are silently skipped.
-fn build_rule_sets() -> Value {
-    const BASE: &str =
-        "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
-    const GEOIP_BASE: &str =
-        "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
-
-    json!([
-        {
-            "type":         "remote",
-            "tag":          "geosite-private",
-            "format":       "binary",
-            "url":          format!("{BASE}/geosite-private.srs"),
-            "update_interval": "7d",
-        },
-        {
-            "type":         "remote",
-            "tag":          "geosite-category-ads-all",
-            "format":       "binary",
-            "url":          format!("{BASE}/geosite-category-ads-all.srs"),
-            "update_interval": "7d",
-        },
-        {
-            "type":         "remote",
-            "tag":          "geoip-private",
-            "format":       "binary",
-            "url":          format!("{GEOIP_BASE}/geoip-private.srs"),
-            "update_interval": "7d",
-        },
-    ])
+    if let Some(tls) = outbound.get_mut("tls").and_then(|t| t.as_object_mut()) {
+        let enabled = tls.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+        if enabled && !tls.contains_key("server_name") {
+            tls.insert("server_name".to_string(), json!(host));
+        }
+    }
+    if let Some(tr) = outbound.get_mut("transport").and_then(|t| t.as_object_mut()) {
+        let kind = tr.get("type").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        if kind == "ws" {
+            let headers = tr.entry("headers").or_insert_with(|| json!({}));
+            if let Some(h) = headers.as_object_mut() {
+                h.entry("Host").or_insert_with(|| json!(host));
+            }
+        } else if kind == "httpupgrade" && !tr.contains_key("host") {
+            tr.insert("host".to_string(), json!(host));
+        }
+    }
 }
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -417,6 +445,130 @@ mod tests {
     }
 
     // ── Golden files (src/gen/golden/*.json) ──────────────────────────────
+
+    /// Collect every string in `v` with its JSON path.
+    fn strings_with_paths(v: &Value, path: String, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::String(s) => out.push((path, s.clone())),
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    strings_with_paths(item, format!("{path}[{i}]"), out);
+                }
+            }
+            Value::Object(map) => {
+                for (k, item) in map {
+                    strings_with_paths(item, format!("{path}.{k}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn all_rule_configs() -> Vec<RulesConfig> {
+        vec![
+            RulesConfig::default(),
+            RulesConfig {
+                default_mode: RoutingMode::OnlyListedViaVpn,
+                rules: vec![rule(AppRuleKind::DomainSuffix, "ir", RuleAction::Direct)],
+            },
+        ]
+    }
+
+    #[test]
+    fn config_is_self_contained() {
+        let mut proxy = golden_proxy();
+        proxy.rules_files = vec![crate::config::RulesFile {
+            rules: vec![crate::config::Rule {
+                kind: RuleKind::GeoSite,
+                pattern: "ir".into(),
+                action: RuleAction::Direct,
+            }],
+        }];
+        for rules in all_rule_configs() {
+            let cfg = build_with_rules(&proxy, &Settings::default(), &rules).unwrap();
+            let text = cfg.to_string();
+            assert!(!text.contains("rule_set"), "config references a rule-set: {text}");
+            assert!(!text.contains("\"remote\""), "config has a remote entry: {text}");
+            let mut strings = Vec::new();
+            strings_with_paths(&cfg, String::new(), &mut strings);
+            for (path, s) in strings {
+                let lower = s.to_ascii_lowercase();
+                if lower.contains("http://") || lower.contains("https://") {
+                    assert!(
+                        path.starts_with(".dns.servers[") && path.ends_with(".server"),
+                        "URL outside DNS server address at {path}: {s}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dns_servers_are_ips_and_proxy_host_resolved_direct() {
+        let mut proxy = golden_proxy();
+        proxy.outbound["server"] = json!("proxy.example.com");
+        let cfg = build(&proxy, &Settings::default()).unwrap();
+        for server in cfg["dns"]["servers"].as_array().unwrap() {
+            let addr = server["server"].as_str().unwrap();
+            assert!(addr.parse::<std::net::IpAddr>().is_ok(), "DNS server not an IP: {addr}");
+        }
+        let local = cfg["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"] == DNS_LOCAL)
+            .unwrap();
+        assert!(local.get("detour").is_none(), "local resolver must not use the proxy");
+        assert_eq!(cfg["route"]["default_domain_resolver"], DNS_LOCAL);
+    }
+
+    #[test]
+    fn local_names_and_private_ips_go_direct() {
+        let cfg = build(&golden_proxy(), &Settings::default()).unwrap();
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["ip_is_private"] == true && r["outbound"] == "direct"));
+        let names = rules
+            .iter()
+            .find(|r| r["domain_suffix"].is_array() && r["outbound"] == "direct")
+            .unwrap();
+        assert_eq!(names["domain"], json!(["localhost"]));
+        assert_eq!(
+            names["domain_suffix"],
+            json!(["localhost", "local", "lan", "internal", "home.arpa"])
+        );
+    }
+
+    /// Runs `sing-box check` on generated samples when sing-box is installed.
+    #[test]
+    fn sing_box_check_accepts_generated_configs() {
+        let Ok(probe) = std::process::Command::new("sing-box").arg("version").output() else {
+            eprintln!("sing-box not installed; skipping");
+            return;
+        };
+        if !probe.status.success() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut proxy = golden_proxy();
+        proxy.outbound["server"] = json!("proxy.example.com");
+        for (i, rules) in all_rule_configs().iter().enumerate() {
+            let path = dir.path().join(format!("sample{i}.json"));
+            write_config_to(&path, &proxy, &Settings::default(), rules).unwrap();
+            let out = std::process::Command::new("sing-box")
+                .args(["check", "--disable-color", "-c"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(out.status.success(), "sing-box check failed: {text}");
+            assert!(!text.contains("WARN"), "sing-box check warned: {text}");
+        }
+    }
+
     // Regenerate with: VPNT_UPDATE_GOLDEN=1 cargo test golden
 
     fn golden_proxy() -> ProxyConfig {

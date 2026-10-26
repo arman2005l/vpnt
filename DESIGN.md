@@ -12,9 +12,11 @@ Atomic writes, 0600 on Unix, never log secrets (uuid, password, keys).
 ## Generated sing-box config
 inbounds: tun (auto_route, strict_route, 172.19.0.1/30, stack mixed) + mixed on 127.0.0.1:<mixed_port>.
 outbounds: proxy (selected config), direct, block.
-route: find_process true, auto_detect_interface true, sniff + hijack-dns, private ranges direct, user rules in order, final per default_mode.
-dns: remote DoH through the proxy + local resolver. experimental.clash_api on 127.0.0.1, random port and secret.
+route: find_process true, auto_detect_interface true, sniff + hijack-dns, private ranges direct (`ip_is_private`) and local names direct (domain localhost; suffixes localhost, local, lan, internal, home.arpa), user rules in order, final per default_mode.
+Self-contained: no rule_set (local or remote), no geoip/geosite, nothing downloaded at startup. The only URLs allowed are DNS server addresses.
+dns: remote DoH through the proxy + local DoH sent direct, both addressed by IP. The proxy outbound's `domain_resolver` and `route.default_domain_resolver` point to the local resolver, so a hostname server is never resolved through itself. experimental.clash_api on 127.0.0.1, random port and secret.
 Match the installed sing-box version's format. Always run `sing-box check -c` before start and show its error in the UI.
+If sing-box exits during startup, show its last FATAL line on the Dashboard (Status: Error: ...) and do not retry automatically; the full output stays in the Logs tab.
 
 ## Core
 Spawn `sing-box run -c <file>`, 1000-line log ring buffer, graceful stop, never call sudo. On permission error show:

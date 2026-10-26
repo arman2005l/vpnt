@@ -30,6 +30,12 @@ sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep $(which sing-box)
 Before each start, vpnt runs `sing-box check -c` on the generated config and
 shows any error in the status bar.
 
+The generated config is self-contained: it uses no geoip/geosite rule-sets and
+downloads nothing at startup, so it works when GitHub is unreachable. Private
+IPs and local names (`localhost`, `.local`, `.lan`, `.internal`, `.home.arpa`)
+always go direct. If sing-box stops during startup, the Dashboard shows
+`Error: <last FATAL line>` and the Logs tab has the full output.
+
 ## Keys
 
 Press `?` (or `F1`) in the app for this list.
