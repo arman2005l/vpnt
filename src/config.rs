@@ -276,15 +276,45 @@ impl Default for Settings {
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create dir {:?}", parent))?;
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create dir {:?}", parent))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)
+    write_private(&tmp, data)
         .with_context(|| format!("failed to write tmp file {:?}", tmp))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename {:?} to {:?}", tmp, path))?;
     Ok(())
+}
+
+/// Write a file that only the owner can read (it may contain proxy credentials).
+#[cfg(unix)]
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` only applies when the file is created, so fix a leftover tmp file too.
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    fs::write(path, data)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,5 +401,36 @@ impl Store {
     pub fn save_settings(&self, settings: &Settings) -> Result<()> {
         let data = serde_json::to_vec_pretty(settings)?;
         atomic_write(&self.settings_path(), &data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atomic_write;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("secret.json");
+
+        atomic_write(&path, b"{}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // overwriting an existing file must keep it private too
+        atomic_write(&path, b"{\"a\":1}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // the directory created by atomic_write must be owner-only
+        let dmode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode, 0o700);
     }
 }
