@@ -3,9 +3,8 @@
 //! The output is written to `<data_dir>/config.json` and consumed by the
 //! sing-box process managed in `src/core.rs`.
 //!
-//! M1 scope: SOCKS5 + HTTP inbounds on localhost, single outbound proxy,
-//! minimal routing (direct for private ranges, proxy for everything else),
-//! and a simple DNS config that works without TUN.
+//! TUN captures system traffic; local SOCKS5 + HTTP listeners remain available.
+//! Private destinations go direct, with DNS hijacked before private-IP routing.
 
 use std::path::Path;
 
@@ -180,6 +179,16 @@ fn build_inbounds(settings: &Settings) -> Value {
             "tag":          "http-in",
             "listen":       "127.0.0.1",
             "listen_port":  http_port,
+        },
+        {
+            "type": "tun",
+            "tag": "tun-in",
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "mtu": 1500,
+            "auto_route": true,
+            "auto_redirect": true,
+            "strict_route": true,
+            "stack": "mixed",
         },
     ])
 }
@@ -395,6 +404,35 @@ mod tests {
     }
 
     #[test]
+    fn tun_is_configured_without_removing_local_proxies() {
+        let cfg = build(&make_proxy(), &make_settings()).unwrap();
+        let inbounds = cfg["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 3);
+        assert_eq!(inbounds[0]["type"], "socks");
+        assert_eq!(inbounds[1]["type"], "http");
+        for inbound in &inbounds[..2] {
+            assert_eq!(inbound["listen"], "127.0.0.1");
+        }
+        let tun = &inbounds[2];
+        assert_eq!(tun["type"], "tun");
+        assert_eq!(tun["address"], json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]));
+        assert_eq!(tun["auto_route"], true);
+        assert_eq!(tun["auto_redirect"], true);
+        assert_eq!(tun["strict_route"], true);
+        assert_eq!(tun["stack"], "mixed");
+        assert_eq!(cfg["route"]["auto_detect_interface"], true);
+    }
+
+    #[test]
+    fn dns_hijack_precedes_private_ip_bypass() {
+        let cfg = build(&make_proxy(), &make_settings()).unwrap();
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        let dns = rules.iter().position(|r| r["action"] == "hijack-dns").unwrap();
+        let private = rules.iter().position(|r| r["ip_is_private"] == true).unwrap();
+        assert!(dns < private);
+    }
+
+    #[test]
     fn direct_mode_sets_final_to_direct() {
         let mut s = make_settings();
         s.default_mode = DefaultMode::Direct;
@@ -541,7 +579,15 @@ mod tests {
     /// Runs `sing-box check` on generated samples when sing-box is installed.
     #[test]
     fn sing_box_check_accepts_generated_configs() {
-        let Ok(probe) = std::process::Command::new("sing-box").arg("version").output() else {
+        let bin = std::env::var_os("VPNT_SING_BOX").unwrap_or_else(|| "sing-box".into());
+        let probe = std::process::Command::new(&bin).arg("version").output();
+        if std::env::var_os("VPNT_SING_BOX").is_some() {
+            assert!(
+                probe.as_ref().is_ok_and(|p| p.status.success()),
+                "VPNT_SING_BOX must point to a working sing-box binary"
+            );
+        }
+        let Ok(probe) = probe else {
             eprintln!("sing-box not installed; skipping");
             return;
         };
@@ -549,23 +595,39 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let mut proxy = golden_proxy();
-        proxy.outbound["server"] = json!("proxy.example.com");
-        for (i, rules) in all_rule_configs().iter().enumerate() {
-            let path = dir.path().join(format!("sample{i}.json"));
-            write_config_to(&path, &proxy, &Settings::default(), rules).unwrap();
-            let out = std::process::Command::new("sing-box")
-                .args(["check", "--disable-color", "-c"])
-                .arg(&path)
-                .output()
-                .unwrap();
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stderr),
-                String::from_utf8_lossy(&out.stdout)
-            );
-            assert!(out.status.success(), "sing-box check failed: {text}");
-            assert!(!text.contains("WARN"), "sing-box check warned: {text}");
+        let mut proxies = vec![golden_proxy()];
+        proxies[0].outbound["server"] = json!("proxy.example.com");
+        for link in [
+            "vless://11111111-2222-3333-4444-555555555555@192.0.2.1:443?security=tls&sni=example.com&type=ws&path=%2Fws",
+            "trojan://test-password@192.0.2.1:443?sni=example.com",
+            "ss://YWVzLTEyOC1nY206dGVzdC1wYXNzd29yZA==@192.0.2.1:443",
+            "hy2://test-password@192.0.2.1:443?sni=example.com",
+            "tuic://11111111-2222-3333-4444-555555555555:test-password@192.0.2.1:443?sni=example.com",
+        ] {
+            proxies.push(crate::ui::app::proxy_from_link(link).unwrap());
+        }
+        use base64::Engine as _;
+        let vmess = base64::engine::general_purpose::STANDARD.encode(
+            r#"{"add":"192.0.2.1","port":443,"id":"11111111-2222-3333-4444-555555555555","net":"tcp","tls":"tls","sni":"example.com"}"#,
+        );
+        proxies.push(crate::ui::app::proxy_from_link(&format!("vmess://{vmess}")).unwrap());
+        for (p, proxy) in proxies.iter().enumerate() {
+            for (i, rules) in all_rule_configs().iter().enumerate() {
+                let path = dir.path().join(format!("sample{p}-{i}.json"));
+                write_config_to(&path, proxy, &Settings::default(), rules).unwrap();
+                let out = std::process::Command::new(&bin)
+                    .args(["check", "--disable-color", "-c"])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stderr),
+                    String::from_utf8_lossy(&out.stdout)
+                );
+                assert!(out.status.success(), "sample{p}-{i}: sing-box check failed: {text}");
+                assert!(!text.contains("WARN"), "sample{p}-{i}: sing-box check warned: {text}");
+            }
         }
     }
 

@@ -155,16 +155,19 @@ fn build_outbound(
 /// Decode base64 userinfo: try as-is (may be base64(method:password)),
 /// then try plain "method:password" split.
 fn decode_userinfo(userinfo: &str) -> Result<(String, String)> {
+    // URL parsers may percent-encode Base64 padding, e.g. '=' as '%3D'.
+    let userinfo = url_decode(userinfo);
+
     // First attempt: treat as base64
-    if let Ok(decoded) = decode_b64_padded(userinfo) {
+    if let Ok(decoded) = decode_b64_padded(&userinfo) {
         if let Ok(s) = std::str::from_utf8(&decoded) {
             if let Some(pos) = s.find(':') {
                 return Ok((s[..pos].to_string(), s[pos + 1..].to_string()));
             }
         }
     }
-    // Second attempt: plain "method:password" (url-decoded)
-    let plain = url_decode(userinfo);
+    // Second attempt: plain "method:password"
+    let plain = userinfo;
     if let Some(pos) = plain.find(':') {
         return Ok((plain[..pos].to_string(), plain[pos + 1..].to_string()));
     }

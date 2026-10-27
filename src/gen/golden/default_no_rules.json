@@ -48,6 +48,19 @@
       "listen_port": 10809,
       "tag": "http-in",
       "type": "http"
+    },
+    {
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "auto_redirect": true,
+      "auto_route": true,
+      "mtu": 1500,
+      "stack": "mixed",
+      "strict_route": true,
+      "tag": "tun-in",
+      "type": "tun"
     }
   ],
   "log": {
