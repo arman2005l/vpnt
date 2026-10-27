@@ -1,5 +1,13 @@
 # vpnt
 
+<div align="center">
+
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://github.com/arman2005l/vpnt)
+
+</div>
+
 A personal terminal UI (TUI) VPN client for Linux. You import proxy share links
 (`vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` / `hy2://`, `tuic://`)
 or a subscription URL. vpnt then writes a [sing-box](https://sing-box.sagernet.org/)
@@ -7,6 +15,22 @@ config and runs `sing-box` as a child process in TUN mode. vpnt does not
 implement any proxy protocol itself.
 
 Only Linux (Ubuntu) is tested. The Windows code paths are stubs.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    User[User] --> UI[VPNT - Rust TUI]
+    Links[Proxy links / subscriptions] --> UI
+    UI --> Config[Generate sing-box config]
+    Config --> Check[Validate config]
+    Check --> Core[sing-box core]
+    Traffic[System traffic] --> TUN[TUN inbound]
+    TUN --> Core
+    Apps[Local applications] --> Local[SOCKS5 / HTTP]
+    Local --> Core
+    Core --> Route[Proxy / Direct / Block]
+```
 
 ## Install
 
@@ -93,3 +117,9 @@ started through `sudo`, it uses `/home/$SUDO_USER/.config/vpnt/` instead.
 | `rules.json` | Routing rules and default mode |
 | `config.json` | Generated sing-box config (contains secrets) |
 | `logs/vpnt.log.YYYY-MM-DD` | vpnt's own log, rotated daily |
+
+## License
+
+VPNT is distributed under the [MIT License](LICENSE).
+
+Third-party components retain their respective licenses.
